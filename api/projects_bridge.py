@@ -19,9 +19,11 @@ Design (per the maintainer's recommended first slice):
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -181,29 +183,72 @@ def _invalidate_cache(db: Path) -> None:
         _cache.pop(str(db), None)
 
 
-def _direct_create_project(conn, *, name: str, primary_path: str) -> str:
-    """Fallback insert mirroring hermes_cli.projects_db.create_project."""
-    import re as _re
-    import secrets as _secrets
-    slug = _re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-_")[:64].strip("-_") or "project"
-    base = slug
-    n = 1
-    while conn.execute("SELECT 1 FROM projects WHERE slug = ?", (slug,)).fetchone() is not None:
-        n += 1
-        slug = base[:60] + f"-{n}"
-    pid = "p_" + _secrets.token_hex(4)
-    now = int(time.time())
-    conn.execute(
-        "INSERT INTO projects (id, slug, name, primary_path, created_at, archived)"
-        " VALUES (?, ?, ?, ?, ?, 0)",
-        (pid, slug, name, primary_path, now),
-    )
-    conn.execute(
-        "INSERT INTO project_folders (project_id, path, label, is_primary, added_at)"
-        " VALUES (?, ?, NULL, 1, ?)",
-        (pid, primary_path, now),
-    )
-    return pid
+def _agent_dir() -> Path | None:
+    """Locate the hermes-agent checkout (same discovery order as api.config)."""
+    try:
+        from api.config import _discover_agent_dir
+        d = _discover_agent_dir()
+        return d if d and (d / "hermes_cli").is_dir() else None
+    except Exception:
+        return None
+
+
+# Subprocess program: runs upstream create_project verbatim in a fresh
+# interpreter that has the agent checkout on sys.path. No logic is
+# reimplemented here — validation, slug uniqueness and txn semantics all
+# belong to hermes_cli.projects_db.
+_CREATE_PROJECT_PROG = """
+import json, sys
+db_path, name, path, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sys.path.insert(0, agent_dir)
+try:
+    from hermes_cli import projects_db as pdb
+    from pathlib import Path
+    conn = pdb.connect(db_path=Path(db_path))
+    try:
+        pid = pdb.create_project(conn, name=name, primary_path=path)
+        row = conn.execute("SELECT slug FROM projects WHERE id = ?", (pid,)).fetchone()
+        conn.commit()
+        print(json.dumps({"ok": True, "id": pid, "slug": row["slug"] if row else None}))
+    finally:
+        conn.close()
+except ValueError as e:
+    print(json.dumps({"ok": False, "kind": "value", "error": str(e)}))
+except Exception as e:
+    print(json.dumps({"ok": False, "kind": "error", "error": str(e)}))
+"""
+
+
+def _create_via_subprocess(db: Path, *, name: str, resolved: str) -> dict:
+    """Run upstream projects_db.create_project in a subprocess with the agent
+    checkout on sys.path. Raises RuntimeError if no agent checkout is found."""
+    agent_dir = _agent_dir()
+    if agent_dir is None:
+        raise RuntimeError("hermes_cli not importable and no agent checkout found — cannot register project")
+    import subprocess
+    try:
+        proc = subprocess.run(
+            # -I keeps the agent checkout's imports isolated from this venv's
+            # site-packages noise; the agent dir goes in via argv + sys.path
+            # because -I also ignores PYTHONPATH.
+            [sys.executable, "-I", "-c", _CREATE_PROJECT_PROG, str(db), name, resolved, str(agent_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"project create subprocess failed: {e}")
+    out = (proc.stdout or "").strip().splitlines()
+    payload = None
+    for line in reversed(out):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                pass
+            break
+    if payload is None:
+        raise RuntimeError(f"project create produced no result (exit {proc.returncode}): {(proc.stderr or '').strip()[:200]}")
+    return payload
 
 
 def create_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
@@ -233,23 +278,14 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
             with contextlib.suppress(Exception):
                 conn.close()
     else:
-        conn = sqlite3.connect(str(db), timeout=5.0)
-        try:
-            conn.row_factory = sqlite3.Row
-            existing = conn.execute(
-                "SELECT p.slug, p.id FROM projects p"
-                " JOIN project_folders pf ON pf.project_id = p.id"
-                " WHERE pf.path = ? LIMIT 1",
-                (resolved,),
-            ).fetchone()
-            if existing is not None:
-                raise ValueError(
-                    f"folder already belongs to project '{existing['slug']}' ({existing['id']}); "
-                    "switch to it instead of creating a duplicate"
-                )
-            slug = _direct_create_project(conn, name=name, primary_path=resolved)
-            conn.commit()
-        finally:
-            conn.close()
+        # hermes_cli is not importable in this process: run the SAME upstream
+        # function in a subprocess against the agent checkout. No local
+        # reimplementation of create_project semantics.
+        payload = _create_via_subprocess(db, name=name, resolved=resolved)
+        if not payload.get("ok"):
+            if payload.get("kind") == "value":
+                raise ValueError(payload.get("error") or "project creation rejected")
+            raise RuntimeError(payload.get("error") or "project creation failed")
+        pid, slug = payload["id"], payload.get("slug")
     _invalidate_cache(db)
     return {"id": pid, "slug": slug, "name": name, "path": resolved, "created": True}
