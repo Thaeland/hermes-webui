@@ -18,6 +18,7 @@ Design (per the maintainer's recommended first slice):
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sqlite3
@@ -156,3 +157,99 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
         if e["path"] not in used:
             merged.append(dict(e))
     return merged
+
+
+# ── Write path: register a WebUI workspace as a Hermes Project ─────────────
+#
+# #5763 Phase-1 slice, write side: creating a project from the WebUI registers
+# it in the profile's authoritative projects.db so Desktop/CLI see it too.
+# Preferred implementation is the upstream hermes_cli.projects_db module itself
+# (same code path as `hermes project create`); a schema-compatible direct
+# insert is the fallback when hermes_cli is not importable in this process.
+
+
+def _projects_db_module():
+    try:
+        import hermes_cli.projects_db as pdb
+        return pdb
+    except Exception:
+        return None
+
+
+def _invalidate_cache(db: Path) -> None:
+    with _cache_lock:
+        _cache.pop(str(db), None)
+
+
+def _direct_create_project(conn, *, name: str, primary_path: str) -> str:
+    """Fallback insert mirroring hermes_cli.projects_db.create_project."""
+    import re as _re
+    import secrets as _secrets
+    slug = _re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-_")[:64].strip("-_") or "project"
+    base = slug
+    n = 1
+    while conn.execute("SELECT 1 FROM projects WHERE slug = ?", (slug,)).fetchone() is not None:
+        n += 1
+        slug = base[:60] + f"-{n}"
+    pid = "p_" + _secrets.token_hex(4)
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO projects (id, slug, name, primary_path, created_at, archived)"
+        " VALUES (?, ?, ?, ?, ?, 0)",
+        (pid, slug, name, primary_path, now),
+    )
+    conn.execute(
+        "INSERT INTO project_folders (project_id, path, label, is_primary, added_at)"
+        " VALUES (?, ?, NULL, 1, ?)",
+        (pid, primary_path, now),
+    )
+    return pid
+
+
+def create_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
+    """Create a Hermes Project for ``path`` in the profile's projects.db.
+
+    Returns ``{'id', 'slug', 'name', 'path', 'created': True}``.
+    Raises ValueError with a user-facing message when the path already belongs
+    to another project or the name is empty; RuntimeError when projects.db is
+    unavailable. Never creates the DB file if it is missing (mode=rw, not rwc).
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("project name must not be empty")
+    db = _projects_db_path(profile_home)
+    if db is None:
+        raise RuntimeError("projects.db not found for this profile — cannot register project")
+    resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
+    pdb = _projects_db_module()
+    if pdb is not None:
+        conn = pdb.connect(db_path=db)
+        try:
+            pid = pdb.create_project(conn, name=name, primary_path=resolved)
+            row = conn.execute("SELECT slug FROM projects WHERE id = ?", (pid,)).fetchone()
+            slug = row["slug"] if row else None
+            conn.commit()
+        finally:
+            with contextlib.suppress(Exception):
+                conn.close()
+    else:
+        conn = sqlite3.connect(str(db), timeout=5.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            existing = conn.execute(
+                "SELECT p.slug, p.id FROM projects p"
+                " JOIN project_folders pf ON pf.project_id = p.id"
+                " WHERE pf.path = ? LIMIT 1",
+                (resolved,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(
+                    f"folder already belongs to project '{existing['slug']}' ({existing['id']}); "
+                    "switch to it instead of creating a duplicate"
+                )
+            slug = _direct_create_project(conn, name=name, primary_path=resolved)
+            conn.commit()
+        finally:
+            conn.close()
+    _invalidate_cache(db)
+    return {"id": pid, "slug": slug, "name": name, "path": resolved, "created": True}
