@@ -17760,6 +17760,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/workspaces/remove":
         return _handle_workspace_remove(handler, body)
 
+    if parsed.path == "/api/workspaces/create_project":
+        return _handle_workspace_create_project(handler, body)
+
     if parsed.path == "/api/workspaces/rename":
         return _handle_workspace_rename(handler, body)
 
@@ -28259,6 +28262,73 @@ def _handle_workspace_add(handler, body):
     except TypeError:
         save_workspaces(wss)
     return j(handler, {"ok": True, "workspaces": wss})
+
+
+def _handle_workspace_create_project(handler, body):
+    """Create a Hermes Project (projects.db) AND a WebUI workspace in one step.
+
+    #5763 write slice: the WebUI "new project" flow registers the project in
+    the profile's authoritative projects.db (visible to Desktop/CLI) instead of
+    only the local picker list. If the path is already a registered workspace
+    the projects.db registration still runs (idempotent on duplicate folder).
+    """
+    path_str = _strip_surrounding_quotes(body.get("path", "").strip())
+    name = _strip_surrounding_quotes(body.get("name", "").strip())
+    auto_create = body.get("create", False)
+    if not path_str:
+        return bad(handler, "path is required")
+    try:
+        from api.workspace import _remote_terminal_workspace_candidate, _resolve_path
+        from api.profiles import get_active_profile_name
+        active_profile = get_active_profile_name()
+        remote_candidate = _remote_terminal_workspace_candidate(path_str, profile=active_profile)
+        candidate = _resolve_path(path_str, profile=active_profile)
+    except (ValueError, OSError, RuntimeError) as e:
+        return bad(handler, f"Invalid path: {_sanitize_error(e)}")
+    if remote_candidate is not None:
+        return bad(handler, "Remote terminal paths cannot be registered as Hermes Projects")
+    if _is_blocked_system_path(candidate):
+        _home = _home_path()
+        if not (_home != Path("/") and (candidate == _home or _is_within(candidate, _home))):
+            return bad(handler, f"Path points to a system directory: {candidate}")
+    if auto_create:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            return bad(handler, f"Could not create directory: {_sanitize_error(e)}")
+    try:
+        p = validate_workspace_to_add(path_str, profile=active_profile)
+    except ValueError as e:
+        return bad(handler, str(e))
+    project_name = name or p.name
+    # 1) Register in projects.db (authoritative store shared with Desktop/CLI).
+    from api.projects_bridge import create_hermes_project
+    try:
+        project = create_hermes_project(str(p), project_name)
+    except ValueError as e:
+        # Path already belongs to another project: not fatal for the workspace
+        # half of the operation — surface it but continue.
+        project = {"error": str(e)}
+    except RuntimeError as e:
+        return bad(handler, _sanitize_error(e))
+    # 2) Ensure the local picker list has it too (harmless if the read bridge
+    # already surfaces it; save_workspaces dedupe keeps this cheap).
+    from api.projects_bridge import merge_hermes_projects
+    try:
+        wss = load_workspaces(profile=active_profile)
+    except TypeError:
+        wss = load_workspaces()
+    if not any(w["path"] == str(p) for w in wss):
+        wss.append({"path": str(p), "name": project_name})
+        try:
+            save_workspaces(wss, profile=active_profile)
+        except TypeError:
+            save_workspaces(wss)
+    try:
+        merged = merge_hermes_projects(load_workspaces(profile=active_profile))
+    except Exception:
+        merged = wss
+    return j(handler, {"ok": True, "project": project, "workspaces": merged})
 
 
 def _handle_workspace_remove(handler, body):

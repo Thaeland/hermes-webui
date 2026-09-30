@@ -1640,6 +1640,8 @@ const LOCALES = {
     workspace_drag_hint: 'Drag to reorder',
     workspace_reorder_failed: 'Reorder failed',
     workspace_added: 'Workspace added',
+    workspace_as_hermes_project: 'Register as Hermes Project (shared with Desktop/CLI)',
+    workspace_project_created: 'Hermes Project created',
     workspace_recovered_notice: (path) => `This session's deleted workspace was recovered to ${path}.`,
     workspace_renamed: 'Workspace renamed',
     workspace_remove_confirm_title: 'Remove workspace',
