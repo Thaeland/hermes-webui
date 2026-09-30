@@ -156,3 +156,70 @@ def test_env_kill_switch(tmp_path, monkeypatch):
     assert load_hermes_project_workspaces(profile_home=tmp_path) == []
     monkeypatch.setenv("HERMES_WEBUI_PROJECTS_DB_SYNC", "1")
     assert len(load_hermes_project_workspaces(profile_home=tmp_path)) == 1
+
+
+# ── Write path: create_hermes_project ───────────────────────────────────────
+
+from api.projects_bridge import create_hermes_project
+
+
+def test_create_project_writes_db_and_visible_on_read(tmp_path):
+    _make_projects_db(tmp_path, [])
+    result = create_hermes_project("/srv/newproj", "New Project", profile_home=tmp_path)
+    assert result["created"] is True
+    assert result["name"] == "New Project"
+    assert result["id"].startswith("p_")
+    # Immediately visible through the read bridge (cache invalidated by create)
+    entries = load_hermes_project_workspaces(profile_home=tmp_path)
+    assert ("/srv/newproj", "New Project") in {(e["path"], e["name"]) for e in entries}
+
+
+def test_create_project_slug_and_primary(tmp_path):
+    db = _make_projects_db(tmp_path, [])
+    create_hermes_project("/srv/My Cool App/", "My Cool App", profile_home=tmp_path)
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT id, slug, primary_path FROM projects").fetchone()
+    assert row["slug"] == "my-cool-app"
+    assert row["primary_path"] == "/srv/My Cool App"  # trailing sep stripped
+    folder = conn.execute(
+        "SELECT path, is_primary FROM project_folders WHERE project_id = ?", (row["id"],)
+    ).fetchone()
+    assert folder["path"] == "/srv/My Cool App" and folder["is_primary"] == 1
+    conn.close()
+
+
+def test_create_project_duplicate_slug_gets_suffix(tmp_path):
+    db = _make_projects_db(tmp_path, [])
+    create_hermes_project("/srv/a", "Dup Name", profile_home=tmp_path)
+    create_hermes_project("/srv/b", "Dup Name", profile_home=tmp_path)
+    conn = sqlite3.connect(db)
+    slugs = [r[0] for r in conn.execute("SELECT slug FROM projects ORDER BY slug")]
+    conn.close()
+    assert slugs == ["dup-name", "dup-name-2"]
+
+
+def test_create_project_duplicate_path_raises(tmp_path):
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "existing", "name": "Existing", "folders": ["/srv/x"]},
+    ])
+    with pytest.raises(ValueError, match="already belongs"):
+        create_hermes_project("/srv/x", "Clash", profile_home=tmp_path)
+
+
+def test_create_project_empty_name_raises(tmp_path):
+    _make_projects_db(tmp_path, [])
+    with pytest.raises(ValueError):
+        create_hermes_project("/srv/x", "  ", profile_home=tmp_path)
+
+
+def test_create_project_without_db_raises(tmp_path):
+    with pytest.raises(RuntimeError, match="projects.db not found"):
+        create_hermes_project("/srv/x", "X", profile_home=tmp_path)
+
+
+def test_create_project_does_not_create_missing_db(tmp_path):
+    # mode=rw (not rwc): a missing DB must never be materialised as a side effect
+    with pytest.raises(RuntimeError):
+        create_hermes_project("/srv/x", "X", profile_home=tmp_path)
+    assert not (tmp_path / "projects.db").exists()
