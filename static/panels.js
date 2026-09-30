@@ -6345,7 +6345,7 @@ async function saveWorkspaceForm(){
     const asProjectEl = $('workspaceFormAsProject');
     const asProject = asProjectEl ? asProjectEl.checked : false;
     if (asProject) {
-      const data = await api('/api/workspaces/create_project', { method:'POST', body: JSON.stringify({ path, name }) });
+      const data = await api('/api/workspaces/create_project', { method:'POST', body: JSON.stringify({ path, name, create: true }) });
       _workspaceList = data.workspaces || [];
       _workspacePreFormDetail = null;
       renderWorkspacesPanel(_workspaceList);
