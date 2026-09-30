@@ -223,3 +223,47 @@ def test_create_project_does_not_create_missing_db(tmp_path):
     with pytest.raises(RuntimeError):
         create_hermes_project("/srv/x", "X", profile_home=tmp_path)
     assert not (tmp_path / "projects.db").exists()
+
+
+# ── Subprocess fallback: no local reimplementation of create_project ───────
+
+AGENT_CHECKOUT = Path.home() / ".hermes" / "hermes-agent"
+
+
+def test_create_project_subprocess_fallback(tmp_path, monkeypatch):
+    """With hermes_cli un-importable in-process, creation must still go
+    through upstream projects_db — via subprocess against the agent checkout."""
+    if not (AGENT_CHECKOUT / "hermes_cli" / "projects_db.py").exists():
+        pytest.skip("agent checkout with hermes_cli not present")
+    db = _make_projects_db(tmp_path, [])
+    monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
+    monkeypatch.setattr("api.projects_bridge._agent_dir", lambda: AGENT_CHECKOUT)
+    result = create_hermes_project("/srv/subproc", "Subproc Project", profile_home=tmp_path)
+    assert result["created"] is True
+    assert result["slug"] == "subproc-project"
+    conn = sqlite3.connect(db)
+    row = conn.execute("SELECT name, primary_path FROM projects").fetchone()
+    conn.close()
+    assert row == ("Subproc Project", "/srv/subproc")
+
+
+def test_create_project_subprocess_fallback_duplicate(tmp_path, monkeypatch):
+    if not (AGENT_CHECKOUT / "hermes_cli" / "projects_db.py").exists():
+        pytest.skip("agent checkout with hermes_cli not present")
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "existing", "name": "Existing", "folders": ["/srv/x"]},
+    ])
+    monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
+    monkeypatch.setattr("api.projects_bridge._agent_dir", lambda: AGENT_CHECKOUT)
+    # The duplicate-path rejection comes from upstream create_project itself,
+    # surfaced through the subprocess payload.
+    with pytest.raises(ValueError, match="already belongs"):
+        create_hermes_project("/srv/x", "Clash", profile_home=tmp_path)
+
+
+def test_create_project_subprocess_no_agent_dir(tmp_path, monkeypatch):
+    _make_projects_db(tmp_path, [])
+    monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
+    monkeypatch.setattr("api.projects_bridge._agent_dir", lambda: None)
+    with pytest.raises(RuntimeError, match="cannot register project"):
+        create_hermes_project("/srv/x", "X", profile_home=tmp_path)
