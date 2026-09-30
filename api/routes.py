@@ -15182,6 +15182,14 @@ def handle_get(handler, parsed) -> bool:
             wss = load_workspaces(profile=active_profile)
         except TypeError:
             wss = load_workspaces()
+        # #5763 read slice: surface the profile's authoritative Hermes Projects
+        # store (projects.db) in the picker. Fail-safe: no DB / error => the
+        # local workspaces.json list unchanged.
+        try:
+            from api.projects_bridge import merge_hermes_projects
+            wss = merge_hermes_projects(wss)
+        except Exception:
+            logger.debug("projects.db workspace merge skipped", exc_info=True)
         try:
             lw = get_last_workspace(profile=active_profile)
         except TypeError:
