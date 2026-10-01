@@ -267,3 +267,68 @@ def test_create_project_subprocess_no_agent_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("api.projects_bridge._agent_dir", lambda: None)
     with pytest.raises(RuntimeError, match="cannot register project"):
         create_hermes_project("/srv/x", "X", profile_home=tmp_path)
+
+
+# ── Write path: archive on workspace removal ─────────────────────────────────
+#
+# The read bridge made projects.db authoritative for the picker list, so
+# removing only the local workspace let the entry reappear on the next poll.
+# archive_hermes_project must soft-delete (archive) the owning DB project so
+# the delete sticks, and must never raise — the local removal already landed.
+
+from api.projects_bridge import archive_hermes_project
+
+
+def test_archive_hides_project_from_listing(tmp_path):
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "gufo", "name": "Gufo", "folders": ["/srv/gufo"]},
+        {"id": "p2", "slug": "omp", "name": "Oh My Pi", "folders": ["/srv/omp"]},
+    ])
+    result = archive_hermes_project("/srv/gufo", profile_home=tmp_path)
+    assert result.get("archived") is True
+    assert result.get("id") == "p1"
+    entries = load_hermes_project_workspaces(profile_home=tmp_path)
+    assert [e["path"] for e in entries] == ["/srv/omp"]
+
+
+def test_archive_is_idempotent(tmp_path):
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    assert archive_hermes_project("/srv/a", profile_home=tmp_path).get("archived") is True
+    # Second removal of the same path: already archived (find_by_primary_path
+    # excludes archived rows) -> no-op, still never raises.
+    second = archive_hermes_project("/srv/a", profile_home=tmp_path)
+    assert second.get("archived") is False
+
+
+def test_archive_unknown_path_is_noop(tmp_path):
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    result = archive_hermes_project("/srv/nope", profile_home=tmp_path)
+    assert result.get("archived") is False
+    assert load_hermes_project_workspaces(profile_home=tmp_path) != []
+
+
+def test_archive_without_db_is_noop(tmp_path):
+    result = archive_hermes_project("/srv/a", profile_home=tmp_path)
+    assert result == {"archived": False, "reason": "no-db"}
+
+
+def test_archive_subprocess_fallback(tmp_path, monkeypatch):
+    """With hermes_cli un-importable in-process, archiving must still go
+    through upstream projects_db — via subprocess against the agent checkout."""
+    if not (AGENT_CHECKOUT / "hermes_cli" / "projects_db.py").exists():
+        pytest.skip("agent checkout with hermes_cli not present")
+    db = _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
+    monkeypatch.setattr("api.projects_bridge._agent_dir", lambda: AGENT_CHECKOUT)
+    result = archive_hermes_project("/srv/a", profile_home=tmp_path)
+    assert result.get("archived") is True
+    conn = sqlite3.connect(db)
+    archived = conn.execute("SELECT archived FROM projects WHERE id='p1'").fetchone()[0]
+    conn.close()
+    assert archived == 1

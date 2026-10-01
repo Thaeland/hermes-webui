@@ -28346,6 +28346,14 @@ def _handle_workspace_remove(handler, body):
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
+    # #5763 read bridge: projects.db re-appends its projects on every list
+    # poll, so removing the local workspace alone makes the delete appear to
+    # do nothing. Archive the owning DB project too (fail-safe, never raises).
+    try:
+        from api.projects_bridge import archive_hermes_project
+        archive_hermes_project(path_str)
+    except Exception:
+        logger.debug("workspace remove: project archive failed for %s", path_str)
     return j(handler, {"ok": True, "workspaces": wss})
 
 
