@@ -26,6 +26,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,9 @@ def _query_projects(db: Path) -> list[tuple[str, str]]:
     folders at all are skipped: a workspace entry needs a real directory.
     """
     # uri=ro + busy_timeout: never create a DB, never block on a writer for long.
-    uri = f"file:{db.as_posix()}?mode=ro"
+    # quote() the path: '#' would become a URI fragment and '?' would split
+    # params early, silently disabling the bridge for such profile homes.
+    uri = "file:" + urllib.parse.quote(db.as_posix(), safe="/:") + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         conn.row_factory = sqlite3.Row
@@ -117,6 +120,16 @@ def load_hermes_project_workspaces(profile_home: Path | None = None) -> list[dic
         key = str(db)
         try:
             mtime = db.stat().st_mtime
+            # Production DBs are WAL (upstream open_db sets journal_mode=wal):
+            # while a long-lived external writer holds the DB open, commits land
+            # in the -wal sidecar and the main file's mtime stays stale until a
+            # checkpoint. Fold the WAL mtime into the cache key so external
+            # creates/archives invalidate the cache promptly.
+            wal = db.with_name(db.name + "-wal")
+            try:
+                mtime = max(mtime, wal.stat().st_mtime)
+            except OSError:
+                pass
         except OSError:
             return []
         with _cache_lock:
@@ -243,9 +256,9 @@ def _create_via_subprocess(db: Path, *, name: str, resolved: str) -> dict:
         if line.startswith("{"):
             try:
                 payload = json.loads(line)
+                break
             except ValueError:
-                pass
-            break
+                continue
     if payload is None:
         raise RuntimeError(f"project create produced no result (exit {proc.returncode}): {(proc.stderr or '').strip()[:200]}")
     return payload
@@ -268,15 +281,22 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
     resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
     pdb = _projects_db_module()
     if pdb is not None:
-        conn = pdb.connect(db_path=db)
         try:
-            pid = pdb.create_project(conn, name=name, primary_path=resolved)
-            row = conn.execute("SELECT slug FROM projects WHERE id = ?", (pid,)).fetchone()
-            slug = row["slug"] if row else None
-            conn.commit()
-        finally:
-            with contextlib.suppress(Exception):
-                conn.close()
+            conn = pdb.connect(db_path=db)
+            try:
+                pid = pdb.create_project(conn, name=name, primary_path=resolved)
+                row = conn.execute("SELECT slug FROM projects WHERE id = ?", (pid,)).fetchone()
+                slug = row["slug"] if row else None
+                conn.commit()
+            finally:
+                with contextlib.suppress(Exception):
+                    conn.close()
+        except sqlite3.Error as e:
+            # Lock contention ("database is locked") and other driver errors
+            # must surface as RuntimeError per this function's contract —
+            # the route maps ValueError/RuntimeError to clean 4xx/5xx bodies
+            # instead of an unhandled-exception 500.
+            raise RuntimeError(f"projects.db write failed: {e}") from e
     else:
         # hermes_cli is not importable in this process: run the SAME upstream
         # function in a subprocess against the agent checkout. No local
@@ -371,11 +391,102 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
     for line in reversed((proc.stdout or "").strip().splitlines()):
         line = line.strip()
         if line.startswith("{"):
-            with contextlib.suppress(ValueError):
+            try:
                 payload = json.loads(line)
-            break
+                break
+            except ValueError:
+                continue
     if not payload or not payload.get("ok"):
         logger.debug("archive_hermes_project subprocess result: %s", payload)
         return {"archived": False, "reason": "error"}
+    _invalidate_cache(db)
+    return payload
+
+
+# ── Write path: rename a Hermes Project when its workspace is renamed ────────
+#
+# merge_hermes_projects makes projects.db authoritative for a path it owns,
+# so renaming only workspaces.json reverts on the next poll. Propagate the
+# new name to the DB (fail-safe, same contract as archive).
+
+_RENAME_PROJECT_PROG = """
+import json, sys
+db_path, path, name, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sys.path.insert(0, agent_dir)
+try:
+    from hermes_cli import projects_db as pdb
+    from pathlib import Path
+    conn = pdb.connect(db_path=Path(db_path))
+    try:
+        proj = pdb.find_by_primary_path(conn, path)
+        if proj is None:
+            print(json.dumps({"ok": True, "renamed": False, "reason": "not-found"}))
+        else:
+            ok = pdb.update_project(conn, proj.id, name=name)
+            conn.commit()
+            print(json.dumps({"ok": True, "renamed": bool(ok), "id": proj.id}))
+    finally:
+        conn.close()
+except Exception as e:
+    print(json.dumps({"ok": False, "error": str(e)}))
+"""
+
+
+def rename_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
+    """Rename the projects.db project owning ``path`` (if any).
+
+    Fail-safe by contract, mirroring archive: any error yields
+    ``{"renamed": False, ...}`` and never raises — the local rename has
+    already succeeded and must not be rolled back by a DB-side problem.
+    """
+    name = (name or "").strip()
+    if not name:
+        return {"renamed": False, "reason": "empty-name"}
+    resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
+    db = _projects_db_path(profile_home)
+    if db is None:
+        return {"renamed": False, "reason": "no-db"}
+    pdb = _projects_db_module()
+    if pdb is not None:
+        try:
+            conn = pdb.connect(db_path=db)
+            try:
+                proj = pdb.find_by_primary_path(conn, resolved)
+                if proj is None:
+                    return {"renamed": False, "reason": "not-found"}
+                ok = pdb.update_project(conn, proj.id, name=name)
+                conn.commit()
+            finally:
+                with contextlib.suppress(Exception):
+                    conn.close()
+            _invalidate_cache(db)
+            return {"renamed": bool(ok), "id": proj.id}
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("rename_hermes_project failed: %s", e)
+            return {"renamed": False, "reason": "error"}
+    agent_dir = _agent_dir()
+    if agent_dir is None:
+        return {"renamed": False, "reason": "no-hermes-cli"}
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", _RENAME_PROJECT_PROG, str(db), resolved, name, str(agent_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("rename_hermes_project subprocess failed: %s", e)
+        return {"renamed": False, "reason": "error"}
+    payload = None
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if not payload or not payload.get("ok"):
+        logger.debug("rename_hermes_project subprocess result: %s", payload)
+        return {"renamed": False, "reason": "error"}
     _invalidate_cache(db)
     return payload
