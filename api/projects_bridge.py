@@ -289,3 +289,93 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
         pid, slug = payload["id"], payload.get("slug")
     _invalidate_cache(db)
     return {"id": pid, "slug": slug, "name": name, "path": resolved, "created": True}
+
+
+# ── Write path: archive a Hermes Project when its workspace is removed ──────
+#
+# #5763 read bridge made projects.db authoritative for the picker list:
+# removing a workspace from workspaces.json alone no longer hides the entry —
+# merge_hermes_projects re-appends it from the DB on the next poll, so the
+# delete "doesn't work". Removing the workspace must therefore also archive the
+# owning project in projects.db (soft delete: restore via Desktop/CLI stays
+# possible; _query_projects only surfaces non-archived rows).
+
+_ARCHIVE_PROJECT_PROG = """
+import json, sys
+db_path, path, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, agent_dir)
+try:
+    from hermes_cli import projects_db as pdb
+    from pathlib import Path
+    conn = pdb.connect(db_path=Path(db_path))
+    try:
+        proj = pdb.find_by_primary_path(conn, path)
+        if proj is None:
+            print(json.dumps({"ok": True, "archived": False, "reason": "not-found"}))
+        else:
+            ok = pdb.archive_project(conn, proj.id)
+            conn.commit()
+            print(json.dumps({"ok": True, "archived": bool(ok), "id": proj.id}))
+    finally:
+        conn.close()
+except Exception as e:
+    print(json.dumps({"ok": False, "error": str(e)}))
+"""
+
+
+def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
+    """Archive the projects.db project owning ``path`` (if any).
+
+    Fail-safe by contract, mirroring the read bridge: any error (no DB, no
+    hermes_cli, subprocess failure) yields ``{"archived": False, ...}`` and
+    never raises — the local workspaces.json removal has already succeeded and
+    must not be rolled back by a DB-side problem.
+    """
+    resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
+    db = _projects_db_path(profile_home)
+    if db is None:
+        return {"archived": False, "reason": "no-db"}
+    pdb = _projects_db_module()
+    if pdb is not None:
+        try:
+            conn = pdb.connect(db_path=db)
+            try:
+                proj = pdb.find_by_primary_path(conn, resolved)
+                if proj is None:
+                    return {"archived": False, "reason": "not-found"}
+                ok = pdb.archive_project(conn, proj.id)
+                conn.commit()
+            finally:
+                with contextlib.suppress(Exception):
+                    conn.close()
+            _invalidate_cache(db)
+            return {"archived": bool(ok), "id": proj.id}
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("archive_hermes_project failed: %s", e)
+            return {"archived": False, "reason": "error"}
+    # hermes_cli not importable here: same upstream functions via subprocess,
+    # matching the create path's fallback style.
+    agent_dir = _agent_dir()
+    if agent_dir is None:
+        return {"archived": False, "reason": "no-hermes-cli"}
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", _ARCHIVE_PROJECT_PROG, str(db), resolved, str(agent_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("archive_hermes_project subprocess failed: %s", e)
+        return {"archived": False, "reason": "error"}
+    payload = None
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            with contextlib.suppress(ValueError):
+                payload = json.loads(line)
+            break
+    if not payload or not payload.get("ok"):
+        logger.debug("archive_hermes_project subprocess result: %s", payload)
+        return {"archived": False, "reason": "error"}
+    _invalidate_cache(db)
+    return payload
