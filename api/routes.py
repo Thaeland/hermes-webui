@@ -28337,11 +28337,19 @@ def _handle_workspace_remove(handler, body):
         return bad(handler, "path is required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
+    # Resolve once and use the same string for the local filter and the DB
+    # archive: the bridge normalizes (abspath/expanduser) while the local
+    # filter was an exact match, so a "~/x" or trailing-slash variant could
+    # archive the shared project while leaving the local entry behind.
+    import os as _os
+    resolved_path = _os.path.abspath(_os.path.expanduser(path_str)).rstrip("/\\")
     try:
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
-    wss = [w for w in wss if w["path"] != path_str]
+    def _same_path(a: str, b: str) -> bool:
+        return _os.path.abspath(_os.path.expanduser(str(a).strip())).rstrip("/\\") == resolved_path
+    wss = [w for w in wss if not _same_path(w["path"], path_str)]
     try:
         save_workspaces(wss, profile=active_profile)
     except TypeError:
@@ -28351,9 +28359,9 @@ def _handle_workspace_remove(handler, body):
     # do nothing. Archive the owning DB project too (fail-safe, never raises).
     try:
         from api.projects_bridge import archive_hermes_project
-        archive_hermes_project(path_str)
+        archive_hermes_project(resolved_path)
     except Exception:
-        logger.debug("workspace remove: project archive failed for %s", path_str)
+        logger.debug("workspace remove: project archive failed for %s", resolved_path)
     return j(handler, {"ok": True, "workspaces": wss})
 
 
@@ -28378,6 +28386,14 @@ def _handle_workspace_rename(handler, body):
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
+    # #5763 read bridge: projects.db is authoritative for the name of a path
+    # it owns, so a local-only rename reverts on the next poll. Propagate to
+    # the DB (fail-safe, never raises).
+    try:
+        from api.projects_bridge import rename_hermes_project
+        rename_hermes_project(path_str, name)
+    except Exception:
+        logger.debug("workspace rename: project rename failed for %s", path_str)
     return j(handler, {"ok": True, "workspaces": wss})
 
 
