@@ -19,9 +19,15 @@ from api.projects_bridge import (
 
 
 def _make_projects_db(home: Path, projects: list[dict]) -> Path:
-    """Create a minimal projects.db matching the upstream schema."""
+    """Create a minimal projects.db matching the upstream schema.
+
+    Uses WAL journal mode to match production: upstream projects_db.open_db
+    sets journal_mode=wal, and the bridge's cache-invalidation contract must
+    be tested against that mode, not DELETE.
+    """
     db = home / "projects.db"
     conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(
         """
         CREATE TABLE projects (
@@ -124,6 +130,29 @@ def test_cache_invalidates_on_mtime(tmp_path):
     }
 
 
+def test_cache_invalidates_with_open_wal_writer(tmp_path):
+    """Regression: production projects.db is WAL. A long-lived external writer
+    (Desktop/gateway) commits into the -wal sidecar; the main DB mtime stays
+    stale until a checkpoint. The cache key must fold in the WAL mtime or
+    external creates are invisible indefinitely."""
+    db = _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    assert len(load_hermes_project_workspaces(profile_home=tmp_path)) == 1  # populate cache
+    writer = sqlite3.connect(db)
+    writer.execute("PRAGMA journal_mode=WAL")
+    try:
+        writer.execute("INSERT INTO projects (id, slug, name, created_at) VALUES ('p2','b','B',1001)")
+        writer.execute("INSERT INTO project_folders VALUES ('p2','/srv/b',NULL,1,2001)")
+        writer.commit()  # committed into -wal; main DB untouched, writer stays open
+        entries = load_hermes_project_workspaces(profile_home=tmp_path)
+        assert {(e["path"], e["name"]) for e in entries} == {
+            ("/srv/a", "A"), ("/srv/b", "B"),
+        }, "external WAL commit must invalidate the cache without a checkpoint"
+    finally:
+        writer.close()
+
+
 def test_merge_renames_local_entry_and_appends_new(tmp_path):
     _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "gufo", "name": "Gufo", "folders": ["/srv/gufo"]},
@@ -165,6 +194,10 @@ from api.projects_bridge import create_hermes_project
 
 def test_create_project_writes_db_and_visible_on_read(tmp_path):
     _make_projects_db(tmp_path, [])
+    # Populate the read cache BEFORE create, so the assertion below actually
+    # proves create invalidates it — on an empty cache the read passes on a
+    # plain miss even if _invalidate_cache were deleted.
+    assert load_hermes_project_workspaces(profile_home=tmp_path) == []
     result = create_hermes_project("/srv/newproj", "New Project", profile_home=tmp_path)
     assert result["created"] is True
     assert result["name"] == "New Project"
@@ -314,6 +347,46 @@ def test_archive_unknown_path_is_noop(tmp_path):
 def test_archive_without_db_is_noop(tmp_path):
     result = archive_hermes_project("/srv/a", profile_home=tmp_path)
     assert result == {"archived": False, "reason": "no-db"}
+
+
+def test_query_handles_hash_in_db_path(tmp_path):
+    """A profile home containing '#' must not silently disable the bridge:
+    the raw f-string URI turned '#' into a fragment and the open failed."""
+    home = tmp_path / "we#ird"
+    home.mkdir()
+    _make_projects_db(home, [{"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]}])
+    entries = load_hermes_project_workspaces(profile_home=home)
+    assert [(e["path"], e["name"]) for e in entries] == [("/srv/a", "A")]
+
+
+# ── Write path: rename_hermes_project ───────────────────────────────────────
+
+from api.projects_bridge import rename_hermes_project
+
+
+def test_rename_updates_db_name(tmp_path):
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "Old", "folders": ["/srv/a"]},
+    ])
+    result = rename_hermes_project("/srv/a", "New Name", profile_home=tmp_path)
+    assert result.get("renamed") is True
+    entries = load_hermes_project_workspaces(profile_home=tmp_path)
+    assert [(e["path"], e["name"]) for e in entries] == [("/srv/a", "New Name")]
+
+
+def test_rename_unknown_path_is_noop(tmp_path):
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    assert rename_hermes_project("/srv/nope", "X", profile_home=tmp_path).get("renamed") is False
+    entries = load_hermes_project_workspaces(profile_home=tmp_path)
+    assert entries[0]["name"] == "A"
+
+
+def test_rename_without_db_is_noop(tmp_path):
+    assert rename_hermes_project("/srv/a", "X", profile_home=tmp_path) == {
+        "renamed": False, "reason": "no-db",
+    }
 
 
 def test_archive_subprocess_fallback(tmp_path, monkeypatch):
