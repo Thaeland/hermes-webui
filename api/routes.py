@@ -28291,6 +28291,13 @@ def _handle_workspace_create_project(handler, body):
         _home = _home_path()
         if not (_home != Path("/") and (candidate == _home or _is_within(candidate, _home))):
             return bad(handler, f"Path points to a system directory: {candidate}")
+    # Fail BEFORE any side effect (mkdir, local save) when the native Projects
+    # manager is unreachable — a fresh profile with no projects.db is fine (the
+    # native manager initializes it), but no-manager installs must not be left
+    # with an orphan directory and a half-saved workspace.
+    from api.projects_bridge import projects_write_supported
+    if not projects_write_supported():
+        return bad(handler, "Hermes Projects are not available for this install (hermes_cli not reachable)")
     if auto_create:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
@@ -28310,6 +28317,8 @@ def _handle_workspace_create_project(handler, body):
         # half of the operation — surface it but continue.
         project = {"error": str(e)}
     except RuntimeError as e:
+        # Directory may exist from auto_create above, but no workspace was
+        # saved and no project registered: the operation is cleanly retryable.
         return bad(handler, _sanitize_error(e))
     # 2) Ensure the local picker list has it too (harmless if the read bridge
     # already surfaces it; save_workspaces dedupe keeps this cheap).
@@ -28381,7 +28390,20 @@ def _handle_workspace_rename(handler, body):
             w["name"] = name
             break
     else:
-        return bad(handler, "Workspace not found", 404)
+        # Not in the local list: a DB-only project (created from Desktop/CLI)
+        # still appears in the picker via the read bridge — rename it in the
+        # DB, which is authoritative for the name of a path it owns.
+        from api.projects_bridge import merge_hermes_projects, rename_hermes_project
+        result = rename_hermes_project(path_str, name)
+        if not result.get("renamed"):
+            return bad(handler, "Workspace not found", 404)
+        try:
+            merged = merge_hermes_projects(load_workspaces(profile=active_profile))
+        except TypeError:
+            merged = merge_hermes_projects(load_workspaces())
+        except Exception:
+            merged = wss
+        return j(handler, {"ok": True, "workspaces": merged})
     try:
         save_workspaces(wss, profile=active_profile)
     except TypeError:
@@ -28414,13 +28436,30 @@ def _handle_workspace_reorder(handler, body):
     except TypeError:
         wss = load_workspaces()
     by_path = {w["path"]: w for w in wss}
-    # Build reordered list: given order first, then any omitted entries
+    # DB-only projects (projects.db, not in workspaces.json) appear in the
+    # picker via the read bridge; without a local row their dragged position
+    # cannot persist and the response silently drops them. Materialize a local
+    # row for any requested path the DB owns.
+    from api.projects_bridge import load_hermes_project_workspaces, merge_hermes_projects
+    import os as _os
+    def _norm(p: str) -> str:
+        return _os.path.abspath(_os.path.expanduser(str(p).strip())).rstrip("/\\")
+    db_by_path = {}
+    try:
+        db_by_path = {_norm(e["path"]): e for e in load_hermes_project_workspaces()}
+    except Exception:
+        pass
     reordered = []
     seen = set()
     for p in paths:
         p = p.strip()
         if p in by_path and p not in seen:
             reordered.append(by_path[p])
+            seen.add(p)
+        elif p not in seen and _norm(p) in db_by_path:
+            entry = db_by_path[_norm(p)]
+            row = {"path": entry["path"], "name": entry["name"]}
+            reordered.append(row)
             seen.add(p)
     # Append any workspaces not mentioned (safety net)
     for w in wss:
@@ -28431,7 +28470,13 @@ def _handle_workspace_reorder(handler, body):
     except TypeError:
         # Legacy signature (test doubles with single-arg lambdas, older forks).
         save_workspaces(reordered)
-    return j(handler, {"ok": True, "workspaces": reordered})
+    # Return the merged view so DB-only entries the caller never mentioned
+    # still appear (the picker renders this response directly).
+    try:
+        merged = merge_hermes_projects(reordered)
+    except Exception:
+        merged = reordered
+    return j(handler, {"ok": True, "workspaces": merged})
 
 
 def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: str = "") -> bool:
