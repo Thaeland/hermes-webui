@@ -6293,7 +6293,7 @@ function _renderWorkspaceForm({ name, path, isEdit }){
         ${isEdit ? '' : `
         <div class="detail-form-row">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" id="workspaceFormAsProject" checked>
+            <input type="checkbox" id="workspaceFormAsProject">
             <span>${esc(t('workspace_as_hermes_project') || 'Register as Hermes Project (shared with Desktop/CLI)')}</span>
           </label>
         </div>`}

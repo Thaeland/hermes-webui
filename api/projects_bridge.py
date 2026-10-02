@@ -264,20 +264,45 @@ def _create_via_subprocess(db: Path, *, name: str, resolved: str) -> dict:
     return payload
 
 
+def projects_write_supported(profile_home: Path | None = None) -> bool:
+    """True when ``create_hermes_project`` can register a project at all.
+
+    Write support needs the native Projects manager (``hermes_cli.projects_db``
+    importable here, or the agent checkout reachable for the subprocess
+    fallback). Callers use this to fail *before* side effects (mkdir, local
+    workspace save) instead of mid-way through registration.
+    """
+    if _projects_db_module() is not None:
+        return True
+    return _agent_dir() is not None
+
+
+def _profile_home_for_write(profile_home: Path | None) -> Path:
+    """Resolve the profile home for a write, even when projects.db is absent."""
+    if profile_home is not None:
+        return Path(profile_home)
+    from api.profiles import get_active_hermes_home
+    return get_active_hermes_home()
+
+
 def create_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
     """Create a Hermes Project for ``path`` in the profile's projects.db.
 
     Returns ``{'id', 'slug', 'name', 'path', 'created': True}``.
     Raises ValueError with a user-facing message when the path already belongs
-    to another project or the name is empty; RuntimeError when projects.db is
-    unavailable. Never creates the DB file if it is missing (mode=rw, not rwc).
+    to another project or the name is empty; RuntimeError when the native
+    Projects manager is unreachable. A missing projects.db is initialized
+    through the native manager (``pdb.connect`` runs the idempotent schema
+    init), so a fresh profile that has never run Desktop/CLI can still opt in
+    to project registration.
     """
     name = (name or "").strip()
     if not name:
         raise ValueError("project name must not be empty")
     db = _projects_db_path(profile_home)
     if db is None:
-        raise RuntimeError("projects.db not found for this profile — cannot register project")
+        # Fresh profile: the native manager creates the DB + schema on connect.
+        db = _profile_home_for_write(profile_home) / "projects.db"
     resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
     pdb = _projects_db_module()
     if pdb is not None:
@@ -291,11 +316,12 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
             finally:
                 with contextlib.suppress(Exception):
                     conn.close()
-        except sqlite3.Error as e:
+        except (sqlite3.Error, OSError) as e:
             # Lock contention ("database is locked") and other driver errors
             # must surface as RuntimeError per this function's contract —
             # the route maps ValueError/RuntimeError to clean 4xx/5xx bodies
-            # instead of an unhandled-exception 500.
+            # instead of an unhandled-exception 500. OSError covers DB-init
+            # failures (e.g. profile home path is not a directory).
             raise RuntimeError(f"projects.db write failed: {e}") from e
     else:
         # hermes_cli is not importable in this process: run the SAME upstream

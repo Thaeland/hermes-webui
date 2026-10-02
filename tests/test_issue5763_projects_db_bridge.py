@@ -246,16 +246,24 @@ def test_create_project_empty_name_raises(tmp_path):
         create_hermes_project("/srv/x", "  ", profile_home=tmp_path)
 
 
-def test_create_project_without_db_raises(tmp_path):
-    with pytest.raises(RuntimeError, match="projects.db not found"):
-        create_hermes_project("/srv/x", "X", profile_home=tmp_path)
+def test_create_project_initializes_missing_db(tmp_path):
+    # Fresh profile (no projects.db): the native manager initializes the DB +
+    # schema on connect, so registration must succeed rather than reject.
+    result = create_hermes_project("/srv/x", "X", profile_home=tmp_path)
+    assert result["created"] is True
+    assert (tmp_path / "projects.db").is_file()
+    entries = load_hermes_project_workspaces(profile_home=tmp_path)
+    assert ("/srv/x", "X") in {(e["path"], e["name"]) for e in entries}
 
 
-def test_create_project_does_not_create_missing_db(tmp_path):
-    # mode=rw (not rwc): a missing DB must never be materialised as a side effect
+def test_create_project_missing_db_parent_dir_fails_clean(tmp_path):
+    # A profile home that cannot hold a DB (parent is a file) must surface as
+    # RuntimeError, not create anything.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
     with pytest.raises(RuntimeError):
-        create_hermes_project("/srv/x", "X", profile_home=tmp_path)
-    assert not (tmp_path / "projects.db").exists()
+        create_hermes_project("/srv/x", "X", profile_home=blocker / "sub")
+    assert not (blocker / "sub").exists()
 
 
 # ── Subprocess fallback: no local reimplementation of create_project ───────
