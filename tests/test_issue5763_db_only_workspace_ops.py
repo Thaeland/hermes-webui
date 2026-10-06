@@ -182,7 +182,7 @@ def test_create_project_route_no_manager_fails_before_side_effects(tmp_path, mon
     monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
     handler = _make_handler()
     with patch("api.projects_bridge.projects_write_supported", return_value=False), \
-         patch("api.routes.load_workspaces", return_value=[]) as mock_load, \
+         patch("api.routes.load_workspaces", return_value=[]), \
          patch("api.routes.save_workspaces", side_effect=AssertionError("must not save")):
         _handle_workspace_create_project(handler, {"path": str(target), "name": "X", "create": True})
     handler.send_response.assert_called_once_with(400)
