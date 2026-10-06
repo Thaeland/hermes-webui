@@ -285,6 +285,30 @@ def _profile_home_for_write(profile_home: Path | None) -> Path:
     return get_active_hermes_home()
 
 
+def projects_db_openable(profile_home: Path | None = None) -> bool:
+    """True when the profile's projects.db can be opened (or freshly created).
+
+    Callers use this to fail *before* side effects (mkdir) when the DB exists
+    but is corrupt/unopenable — a failed opt-in registration must not leave a
+    newly created empty folder behind. When the native manager is not
+    importable the subprocess fallback will surface its own errors, so this
+    returns True rather than duplicating that probe.
+    """
+    try:
+        db = _projects_db_path(profile_home)
+        if db is None:
+            db = _profile_home_for_write(profile_home) / "projects.db"
+        pdb = _projects_db_module()
+        if pdb is None:
+            return True
+        conn = pdb.connect(db_path=db)
+        with contextlib.suppress(Exception):
+            conn.close()
+        return True
+    except Exception:
+        return False
+
+
 def create_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
     """Create a Hermes Project for ``path`` in the profile's projects.db.
 

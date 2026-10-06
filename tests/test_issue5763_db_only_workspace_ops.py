@@ -225,3 +225,138 @@ def test_reorder_omitting_db_only_entry_still_returns_it(db_only):
     paths = [w["path"] for w in resp["workspaces"]]
     # DB-only entry not mentioned in the request still appears (merged view).
     assert str(db_only) in paths
+
+
+# ── Re-gate finding 1: remove must return the merged post-mutation view ────
+
+
+def test_remove_db_only_keeps_surviving_neighbor_in_response(tmp_path, monkeypatch):
+    from api.routes import _handle_workspace_remove
+    a = tmp_path / "srv" / "proj-a"
+    b = tmp_path / "srv" / "proj-b"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    _make_projects_db(tmp_path, [
+        {"id": "p_a", "slug": "a", "name": "A", "folders": [str(a)]},
+        {"id": "p_b", "slug": "b", "name": "B", "folders": [str(b)]},
+    ])
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    saved = {}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: saved.setdefault("wss", wss)):
+        _handle_workspace_remove(handler, {"path": str(a)})
+    handler.send_response.assert_called_once_with(200)
+    resp = _response(handler)
+    paths = [w["path"] for w in resp["workspaces"]]
+    # Survivor present in the mutation response...
+    assert str(b) in paths
+    assert str(a) not in paths
+    # ...no invented local duplicate for the removed DB-only entry...
+    assert saved.get("wss") == []
+    # ...and the next GET agrees.
+    from api.projects_bridge import load_hermes_project_workspaces
+    get_paths = {e["path"] for e in load_hermes_project_workspaces(profile_home=tmp_path)}
+    assert get_paths == {str(b)}
+
+
+def test_remove_local_only_response_unchanged(tmp_path, monkeypatch):
+    # Local-only workspace: merged projection equals the local list (no DB
+    # entries), so existing UI behavior is preserved.
+    from api.routes import _handle_workspace_remove
+    _make_projects_db(tmp_path, [])
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    local = {"path": "/home/user/keep", "name": "Keep"}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[local, {"path": "/home/user/gone", "name": "Gone"}]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: wss):
+        _handle_workspace_remove(handler, {"path": "/home/user/gone"})
+    resp = _response(handler)
+    assert [w["path"] for w in resp["workspaces"]] == ["/home/user/keep"]
+
+
+# ── Re-gate finding 2: unavailable shared writer must not report success ───
+
+
+def _no_writer(monkeypatch):
+    # Read bridge stays intact (raw sqlite); only the native write manager and
+    # the subprocess fallback disappear — the reviewer's exact scenario.
+    monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
+    monkeypatch.setattr("api.projects_bridge._agent_dir", lambda: None)
+
+
+def test_rename_shared_backed_fails_when_writer_unavailable(db_only, monkeypatch):
+    from api.routes import _handle_workspace_rename
+    _no_writer(monkeypatch)
+    local_mirror = {"path": str(db_only), "name": "DB Only"}
+    save_calls = []
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[dict(local_mirror)]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: save_calls.append(wss)):
+        _handle_workspace_rename(handler, {"path": str(db_only), "name": "Should Not Stick"})
+    handler.send_response.assert_called_once_with(500)
+    # Local state untouched: nothing saved, native row unchanged.
+    assert save_calls == []
+    conn = sqlite3.connect(db_only.parent.parent / "projects.db")
+    try:
+        assert conn.execute("SELECT name FROM projects WHERE id='p_db1'").fetchone()[0] == "DB Only"
+    finally:
+        conn.close()
+    # Next GET still shows the authoritative native name.
+    from api.projects_bridge import load_hermes_project_workspaces
+    names = {e["path"]: e["name"] for e in load_hermes_project_workspaces(profile_home=db_only.parent.parent)}
+    assert names[str(db_only)] == "DB Only"
+
+
+def test_remove_shared_backed_fails_when_writer_unavailable(db_only, monkeypatch):
+    from api.routes import _handle_workspace_remove
+    _no_writer(monkeypatch)
+    local_mirror = {"path": str(db_only), "name": "DB Only"}
+    save_calls = []
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[dict(local_mirror)]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: save_calls.append(wss)):
+        _handle_workspace_remove(handler, {"path": str(db_only)})
+    handler.send_response.assert_called_once_with(400)
+    assert save_calls == []
+    # The native project is still live: next GET restores it.
+    from api.projects_bridge import load_hermes_project_workspaces
+    paths = {e["path"] for e in load_hermes_project_workspaces(profile_home=db_only.parent.parent)}
+    assert str(db_only) in paths
+
+
+def test_rename_local_only_still_works_without_writer(tmp_path, monkeypatch):
+    # Legitimate local-only ops must NOT fail when the writer is unavailable.
+    from api.routes import _handle_workspace_rename
+    _make_projects_db(tmp_path, [])
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    _no_writer(monkeypatch)
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[{"path": "/home/user/x", "name": "X"}]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: wss):
+        _handle_workspace_rename(handler, {"path": "/home/user/x", "name": "Renamed Local"})
+    handler.send_response.assert_called_once_with(200)
+    resp = _response(handler)
+    assert next(w for w in resp["workspaces"] if w["path"] == "/home/user/x")["name"] == "Renamed Local"
+
+
+# ── Optional nit: corrupt DB must not orphan a new folder ──────────────────
+
+
+def test_create_project_corrupt_db_fails_before_mkdir(tmp_path, monkeypatch):
+    from api.routes import _handle_workspace_create_project
+    fresh_home = tmp_path / "profile"
+    fresh_home.mkdir()
+    (fresh_home / "projects.db").write_bytes(b"this is not a sqlite database at all")
+    target = tmp_path / "srv" / "never-made"
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: fresh_home)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[]), \
+         patch("api.routes.save_workspaces", side_effect=AssertionError("must not save")):
+        _handle_workspace_create_project(handler, {"path": str(target), "name": "X", "create": True})
+    handler.send_response.assert_called_once_with(400)
+    assert not target.exists()

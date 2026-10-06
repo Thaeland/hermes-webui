@@ -28295,9 +28295,13 @@ def _handle_workspace_create_project(handler, body):
     # manager is unreachable — a fresh profile with no projects.db is fine (the
     # native manager initializes it), but no-manager installs must not be left
     # with an orphan directory and a half-saved workspace.
-    from api.projects_bridge import projects_write_supported
+    from api.projects_bridge import projects_db_openable, projects_write_supported
     if not projects_write_supported():
         return bad(handler, "Hermes Projects are not available for this install (hermes_cli not reachable)")
+    # Also probe DB-open viability before mkdir: an existing-but-corrupt DB
+    # must not leave a newly created empty folder behind on a failed opt-in.
+    if not projects_db_openable():
+        return bad(handler, "projects.db exists but cannot be opened — repair it before registering projects")
     if auto_create:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
@@ -28358,6 +28362,31 @@ def _handle_workspace_remove(handler, body):
         wss = load_workspaces()
     def _same_path(a: str, b: str) -> bool:
         return _os.path.abspath(_os.path.expanduser(str(a).strip())).rstrip("/\\") == resolved_path
+    # Decide shared-backed BEFORE mutating local state: if the picker entry
+    # comes from projects.db, the DB archive must succeed first — otherwise
+    # the local removal would report success while the next GET restores the
+    # still-unarchived project (re-gate finding 2).
+    from api.projects_bridge import (
+        archive_hermes_project,
+        load_hermes_project_workspaces,
+        merge_hermes_projects,
+    )
+    try:
+        db_paths = {
+            _os.path.abspath(_os.path.expanduser(str(e["path"]).strip())).rstrip("/\\")
+            for e in load_hermes_project_workspaces() if e.get("path")
+        }
+    except Exception:
+        db_paths = set()
+    shared_backed = resolved_path in db_paths
+    if shared_backed:
+        result = archive_hermes_project(resolved_path)
+        if not result.get("archived") and result.get("reason") != "not-found":
+            return bad(
+                handler,
+                "Could not archive the shared Hermes Project (projects writer unavailable); "
+                "workspace left unchanged.",
+            )
     wss = [w for w in wss if not _same_path(w["path"], path_str)]
     try:
         save_workspaces(wss, profile=active_profile)
@@ -28365,13 +28394,22 @@ def _handle_workspace_remove(handler, body):
         save_workspaces(wss)
     # #5763 read bridge: projects.db re-appends its projects on every list
     # poll, so removing the local workspace alone makes the delete appear to
-    # do nothing. Archive the owning DB project too (fail-safe, never raises).
+    # do nothing. Archive the owning DB project too.
+    if not shared_backed:
+        # Local-only path: best-effort archive in case the bridge view was
+        # stale (fail-safe, never raises).
+        try:
+            archive_hermes_project(resolved_path)
+        except Exception:
+            logger.debug("workspace remove: project archive failed for %s", resolved_path)
+    # Return the merged post-mutation projection (same view as GET): the
+    # filtered local list alone would omit surviving DB-only neighbors and
+    # make them vanish from the picker until the next poll (re-gate finding 1).
     try:
-        from api.projects_bridge import archive_hermes_project
-        archive_hermes_project(resolved_path)
+        merged = merge_hermes_projects(wss)
     except Exception:
-        logger.debug("workspace remove: project archive failed for %s", resolved_path)
-    return j(handler, {"ok": True, "workspaces": wss})
+        merged = wss
+    return j(handler, {"ok": True, "workspaces": merged})
 
 
 def _handle_workspace_rename(handler, body):
@@ -28396,7 +28434,11 @@ def _handle_workspace_rename(handler, body):
         from api.projects_bridge import merge_hermes_projects, rename_hermes_project
         result = rename_hermes_project(path_str, name)
         if not result.get("renamed"):
-            return bad(handler, "Workspace not found", 404)
+            if result.get("reason") in ("not-found", "no-db"):
+                return bad(handler, "Workspace not found", 404)
+            # DB owns the path but the writer failed (unavailable manager,
+            # driver error): a 200 here would be undone by the next GET.
+            return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
         try:
             merged = merge_hermes_projects(load_workspaces(profile=active_profile))
         except TypeError:
@@ -28404,19 +28446,42 @@ def _handle_workspace_rename(handler, body):
         except Exception:
             merged = wss
         return j(handler, {"ok": True, "workspaces": merged})
+    # Local mirror found. If projects.db also owns this path it is
+    # authoritative for the name: rename there FIRST — a failed shared
+    # rename must not commit a local name the next GET would revert
+    # (re-gate finding 2).
+    import os as _os
+    resolved_path = _os.path.abspath(_os.path.expanduser(path_str)).rstrip("/\\")
+    from api.projects_bridge import load_hermes_project_workspaces, merge_hermes_projects, rename_hermes_project
+    try:
+        db_paths = {
+            _os.path.abspath(_os.path.expanduser(str(e["path"]).strip())).rstrip("/\\")
+            for e in load_hermes_project_workspaces() if e.get("path")
+        }
+    except Exception:
+        db_paths = set()
+    shared_backed = resolved_path in db_paths
+    if shared_backed:
+        result = rename_hermes_project(resolved_path, name)
+        if not result.get("renamed") and result.get("reason") != "not-found":
+            return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
     try:
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
-    # #5763 read bridge: projects.db is authoritative for the name of a path
-    # it owns, so a local-only rename reverts on the next poll. Propagate to
-    # the DB (fail-safe, never raises).
+    if not shared_backed:
+        # Local-only path: best-effort DB rename in case the bridge view was
+        # stale (fail-safe, never raises).
+        try:
+            rename_hermes_project(path_str, name)
+        except Exception:
+            logger.debug("workspace rename: project rename failed for %s", path_str)
+    # Merged projection so DB-only neighbors survive in the response view.
     try:
-        from api.projects_bridge import rename_hermes_project
-        rename_hermes_project(path_str, name)
+        merged = merge_hermes_projects(wss)
     except Exception:
-        logger.debug("workspace rename: project rename failed for %s", path_str)
-    return j(handler, {"ok": True, "workspaces": wss})
+        merged = wss
+    return j(handler, {"ok": True, "workspaces": merged})
 
 
 def _handle_workspace_reorder(handler, body):
