@@ -360,3 +360,30 @@ def test_create_project_corrupt_db_fails_before_mkdir(tmp_path, monkeypatch):
         _handle_workspace_create_project(handler, {"path": str(target), "name": "X", "create": True})
     handler.send_response.assert_called_once_with(400)
     assert not target.exists()
+
+
+# ── Greptile P1: failed ownership read must not prove local-only ───────────
+
+
+def test_remove_fails_closed_when_ownership_unreadable(db_only):
+    from api.routes import _handle_workspace_remove
+    saved = {}
+    handler = _make_handler()
+    with patch("api.projects_bridge.load_project_state", return_value=([], set(), False)), \
+         patch("api.routes.load_workspaces", return_value=[{"path": str(db_only), "name": "DB Only"}]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: saved.setdefault("wss", wss)):
+        _handle_workspace_remove(handler, {"path": str(db_only)})
+    handler.send_response.assert_called_once_with(400)
+    assert not saved, "local list must be untouched when ownership is unknown"
+
+
+def test_rename_fails_closed_when_ownership_unreadable(db_only):
+    from api.routes import _handle_workspace_rename
+    saved = {}
+    handler = _make_handler()
+    with patch("api.projects_bridge.load_project_state", return_value=([], set(), False)), \
+         patch("api.routes.load_workspaces", return_value=[{"path": str(db_only), "name": "DB Only"}]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: saved.setdefault("wss", wss)):
+        _handle_workspace_rename(handler, {"path": str(db_only), "name": "Sneaky"})
+    handler.send_response.assert_called_once_with(500)
+    assert not saved, "local list must be untouched when ownership is unknown"
