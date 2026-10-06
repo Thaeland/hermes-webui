@@ -6871,7 +6871,7 @@ const LOCALES = {
     profile_name_label: 'Имя',
     profile_base_url_label: 'Базовый URL',
     profile_api_key_label: 'API-ключ',
-  
+
     // Session management and settings keys
     session_archive: 'Архивировать беседу',
     session_hide_external: 'Скрыть из списка',
@@ -8663,7 +8663,7 @@ const LOCALES = {
     profile_name_label: 'Nombre',
     profile_base_url_label: 'URL base',
     profile_api_key_label: 'Clave API',
-  
+
     cmd_status: 'Show session info',
     // Session management and settings keys (en fallback — pending translation)
     session_archive: 'Archive conversation',
@@ -10094,7 +10094,7 @@ const LOCALES = {
     profile_name_label: 'Name',
     profile_base_url_label: 'Basis-URL',
     profile_api_key_label: 'API-Schlüssel',
-  
+
     // Session management and settings keys (en fallback — pending translation)
     session_archive: 'Archive conversation',
     session_hide_external: 'Aus Liste ausblenden',
@@ -10898,7 +10898,7 @@ const LOCALES = {
     cancelling: '正在取消...',
     cancel_failed: '取消失败。',
     mic_denied: '麦克风访问被拒绝，请检查浏览器权限。',
-    mic_insecure_origin: '语音输入需要安全连接。请通过 HTTPS 协议或从本地主机打开Hermes，以便使用麦克风。', 
+    mic_insecure_origin: '语音输入需要安全连接。请通过 HTTPS 协议或从本地主机打开Hermes，以便使用麦克风。',
     mic_no_speech: '没有检测到语音，请再试一次。',
     mic_network: '语音识别当前不可用。',
     mic_error: '语音输入出错：',
@@ -12207,7 +12207,7 @@ const LOCALES = {
     profile_name_label: '名称',
     profile_base_url_label: '基础 URL',
     profile_api_key_label: 'API 密钥',
-  
+
     // Session management and settings keys (en fallback — pending translation)
     session_archive: '归档会话',
     session_hide_external: '从列表中隐藏',
@@ -12318,8 +12318,8 @@ const LOCALES = {
     settings_label_render_user_markdown: '在用户消息中渲染Markdown格式文本',
     settings_label_large_text_paste_as_attachment: '将粘贴的大段文本作为文件附加。',
     settings_desc_large_text_paste_as_attachment: '启用此功能后，粘贴的长文本将作为.md附件，而非直接填充到编辑器中。',
-    settings_label_show_titlebar_profile: '在标题栏中显示配置文件切换器', 
-    settings_desc_show_titlebar_profile: '启用后，应用程序左上角的标题栏会出现一个配置文件切换器按钮，这样您就可以在任意标签页中切换配置文件。默认情况下此功能关闭；无论此设置如何，撰写框底部始终有一个配置文件切换器。', 
+    settings_label_show_titlebar_profile: '在标题栏中显示配置文件切换器',
+    settings_desc_show_titlebar_profile: '启用后，应用程序左上角的标题栏会出现一个配置文件切换器按钮，这样您就可以在任意标签页中切换配置文件。默认情况下此功能关闭；无论此设置如何，撰写框底部始终有一个配置文件切换器。',
     settings_desc_render_user_markdown: '启用后，您自己消息中的加粗、斜体、链接及其他Markdown格式会被渲染。默认关闭；无论此设置如何，代码块和数学公式始终会被渲染。',
     settings_label_project_quick_create: '显示每个项目的新建对话按钮',
     settings_desc_project_quick_create: '启用后，侧边栏中的每个项目卡片都会出现一个 + 按钮，用于在该项目中开始新对话。',
@@ -14209,8 +14209,8 @@ const LOCALES = {
     workspace_drag_hint: '拖曳以重新排列',
     workspace_reorder_failed: '重新排列失敗',
     workspace_added: '工作區已新增',
-    workspace_as_hermes_project: 'Registrar como Projeto Hermes (compartilhado com Desktop/CLI)',
-    workspace_project_created: 'Projeto Hermes criado',
+    workspace_as_hermes_project: '註冊為 Hermes 專案（與 Desktop/CLI 共享）',
+    workspace_project_created: 'Hermes 專案已建立',
     workspace_recovered_notice: (path) => `此工作階段已刪除的工作區已復原至 ${path}。`,
     workspace_renamed: '工作區已重新命名',
     workspace_remove_confirm_title: '移除工作區',
@@ -25166,7 +25166,7 @@ const LOCALES = {
     dictation_append_desc: 'When ON, dictated text is appended to any text already in the composer (with a space if needed). When OFF, dictated text replaces the composer content.',
     voice_mode_toggle: 'Chế độ giọng nói',
     voice_mode_toggle_active: 'Thoát chế độ giọng nói',
-    // Turn-based voice mode (#1333)    
+    // Turn-based voice mode (#1333)
     voice_listening: 'Đang nghe…',
     voice_speaking: 'Đang nói…',
     voice_thinking: 'Đang suy nghĩ…',

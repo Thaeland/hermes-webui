@@ -30,8 +30,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# path -> (db_mtime, [(path, name), ...])
-_cache: dict[str, tuple[float | None, list[tuple[str, str]]]] = {}
+# path -> ((db_mtime, wal_mtime), active_entries, archived_paths)
+_cache: dict[str, tuple[tuple[float | None, float | None], list[tuple[str, str]], set[str]]] = {}
 _cache_lock = threading.Lock()
 
 # Env kill-switch: set HERMES_WEBUI_PROJECTS_DB_SYNC=0 to disable the bridge.
@@ -56,12 +56,20 @@ def _projects_db_path(profile_home: Path | None) -> Path | None:
     return db if db.is_file() else None
 
 
-def _query_projects(db: Path) -> list[tuple[str, str]]:
-    """Return (path, name) for each non-archived project with a usable folder.
+def _query_projects(db: Path) -> tuple[list[tuple[str, str]], set[str]]:
+    """Return ``(active_entries, archived_paths)`` for the profile's projects.
 
     A project's workspace path is its primary folder when set, otherwise any
     attached folder (lowest ``added_at`` for determinism). Projects with no
     folders at all are skipped: a workspace entry needs a real directory.
+
+    Archived paths are returned so the merge can also HIDE local mirror rows
+    whose shared project was archived from Desktop/CLI — otherwise the picker
+    keeps showing a project the shared store no longer considers active.
+
+    Raises sqlite.Error on any read failure (missing tables, lock, corrupt
+    file): callers must distinguish "no projects" from "could not tell" —
+    a failed read is never authoritative and must never be cached.
     """
     # uri=ro + busy_timeout: never create a DB, never block on a writer for long.
     # quote() the path: '#' would become a URI fragment and '?' would split
@@ -72,7 +80,7 @@ def _query_projects(db: Path) -> list[tuple[str, str]]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT p.name AS name,
+            SELECT p.name AS name, p.archived AS archived,
                    COALESCE(
                        (SELECT pf.path FROM project_folders pf
                          WHERE pf.project_id = p.id AND pf.is_primary = 1
@@ -82,66 +90,94 @@ def _query_projects(db: Path) -> list[tuple[str, str]]:
                          ORDER BY pf.added_at ASC LIMIT 1)
                    ) AS path
             FROM projects p
-            WHERE COALESCE(p.archived, 0) = 0
             ORDER BY p.created_at ASC
             """
         ).fetchall()
-    except sqlite3.Error:
-        # Missing tables / older schema — treat as "no opinion".
-        return []
     finally:
         conn.close()
 
     out: list[tuple[str, str]] = []
+    archived: set[str] = set()
     seen: set[str] = set()
     for r in rows:
         path = (r["path"] or "").strip()
         name = (r["name"] or "").strip()
-        if not path or not name or path in seen:
+        if not path:
+            continue
+        if r["archived"]:
+            archived.add(path)
+            continue
+        if not name or path in seen:
             continue
         seen.add(path)
         out.append((path, name))
-    return out
+    return out, archived
+
+
+def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], set[str], bool]:
+    """Return ``(active_entries, archived_paths, read_ok)`` from projects.db.
+
+    ``read_ok`` is False when the DB exists but could not be read (lock,
+    corrupt file, older schema). Callers MUST treat a failed read as
+    "unknown", never as "no projects": an empty result from a failed read is
+    not authoritative and must not hide shared projects, drop local rows, or
+    prove a path is local-only. Failed reads are never cached — the next poll
+    re-queries, so a transient error self-heals without waiting for a
+    timestamp change.
+
+    The cache key tracks the DB and WAL mtimes SEPARATELY: a max() of the two
+    lets a newer main-DB timestamp mask a WAL commit (future-dated restore,
+    coarse-timestamp filesystems), leaving stale entries cached.
+    """
+    if not _sync_enabled():
+        return [], set(), True
+    try:
+        db = _projects_db_path(profile_home)
+        if db is None:
+            # No shared store at all: trivially "read fine, nothing there".
+            return [], set(), True
+        key = str(db)
+        try:
+            db_mtime = db.stat().st_mtime
+            wal = db.with_name(db.name + "-wal")
+            try:
+                wal_mtime: float | None = wal.stat().st_mtime
+            except OSError:
+                wal_mtime = None
+        except OSError:
+            return [], set(), True
+        with _cache_lock:
+            cached = _cache.get(key)
+            if cached is not None and cached[0] == (db_mtime, wal_mtime):
+                entries, archived = cached[1], cached[2]
+            else:
+                try:
+                    entries, archived = _query_projects(db)
+                except sqlite3.Error as e:
+                    # Failed read: never cache, report unknown.
+                    logger.debug("projects.db read failed (not cached): %s", e)
+                    return [], set(), False
+                _cache[key] = ((db_mtime, wal_mtime), entries, archived)
+        return (
+            [{"path": p, "name": n, "source": "hermes_project"} for p, n in entries],
+            set(archived),
+            True,
+        )
+    except Exception:
+        logger.debug("projects.db bridge failed; falling back to local workspaces", exc_info=True)
+        return [], set(), False
 
 
 def load_hermes_project_workspaces(profile_home: Path | None = None) -> list[dict]:
     """Return workspace-shaped entries ``{'path','name','source'}`` from projects.db.
 
-    Never raises: any failure returns ``[]`` so callers fall back to the
-    WebUI-local workspace list unchanged.
+    Fail-safe convenience wrapper: any failure returns ``[]`` so callers that
+    only list projects fall back to the WebUI-local workspace list unchanged.
+    Callers that MUTATE based on ownership must use ``load_project_state``
+    instead and honor ``read_ok``.
     """
-    if not _sync_enabled():
-        return []
-    try:
-        db = _projects_db_path(profile_home)
-        if db is None:
-            return []
-        key = str(db)
-        try:
-            mtime = db.stat().st_mtime
-            # Production DBs are WAL (upstream open_db sets journal_mode=wal):
-            # while a long-lived external writer holds the DB open, commits land
-            # in the -wal sidecar and the main file's mtime stays stale until a
-            # checkpoint. Fold the WAL mtime into the cache key so external
-            # creates/archives invalidate the cache promptly.
-            wal = db.with_name(db.name + "-wal")
-            try:
-                mtime = max(mtime, wal.stat().st_mtime)
-            except OSError:
-                pass
-        except OSError:
-            return []
-        with _cache_lock:
-            cached = _cache.get(key)
-            if cached is not None and cached[0] == mtime:
-                entries = cached[1]
-            else:
-                entries = _query_projects(db)
-                _cache[key] = (mtime, entries)
-        return [{"path": p, "name": n, "source": "hermes_project"} for p, n in entries]
-    except Exception:
-        logger.debug("projects.db bridge failed; falling back to local workspaces", exc_info=True)
-        return []
+    entries, _archived, ok = load_project_state(profile_home=profile_home)
+    return entries if ok else []
 
 
 def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = None) -> list[dict]:
@@ -149,19 +185,30 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
 
     - projects.db is authoritative for a path it owns: a local entry with the
       same path takes the project's display name.
+    - A local mirror row whose shared project was ARCHIVED (from Desktop/CLI)
+      is hidden: the shared store no longer considers the project active, so
+      the picker must not keep showing it.
     - Local-only entries keep their order and names (WebUI additions still work).
     - DB projects not present locally are appended.
+    - A FAILED DB read is not authoritative: local entries pass through
+      untouched (no archive-hiding, no renames).
     Never mutates the input list.
     """
-    db_entries = load_hermes_project_workspaces(profile_home=profile_home)
-    if not db_entries:
+    db_entries, archived, read_ok = load_project_state(profile_home=profile_home)
+    if not read_ok:
+        return list(workspaces)
+    if not db_entries and not archived:
         return list(workspaces)
     db_by_path = {e["path"]: e for e in db_entries}
     merged: list[dict] = []
     used: set[str] = set()
     for w in workspaces:
         entry = dict(w)
-        hit = db_by_path.get(entry.get("path", ""))
+        path = entry.get("path", "")
+        if path in archived:
+            # Shared project retired: hide the local mirror row too.
+            continue
+        hit = db_by_path.get(path)
         if hit is not None:
             entry["name"] = hit["name"]
             entry["source"] = "hermes_project"

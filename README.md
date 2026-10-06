@@ -48,7 +48,7 @@ This gives you nearly **1:1 parity with Hermes CLI from a convenient web UI** wh
 ## Contents
 
 [<img width="750" alt="image" src="https://github.com/user-attachments/assets/7e9544a7-ba47-4fc7-8142-1d9d16b17065" />
-](https://get-hermes.ai/setup/) 
+](https://get-hermes.ai/setup/)
 
 - [Why Hermes](#why-hermes) — what it is and how it compares
 - [Quick start](#quick-start) — clone + `bootstrap.py` / `start.sh` / `ctl.sh`
@@ -99,7 +99,7 @@ What makes it different from other agentic tools:
 | Provider-agnostic | Yes | No (Claude only) | Yes | Yes | Yes |
 | Open source | Yes (MIT) | No | Yes | Yes | Yes |
 
-† Claude Code has CLAUDE.md / MEMORY.md project context and rolling auto-memory, but not full automatic cross-session recall  
+† Claude Code has CLAUDE.md / MEMORY.md project context and rolling auto-memory, but not full automatic cross-session recall
 ‡ Claude Code has cloud-managed scheduling (Anthropic infrastructure) and session-scoped `/loop`; no self-hosted cron
 
 **The closest competitor is OpenClaw** — both are always-on, self-hosted, open-source agents
@@ -243,6 +243,26 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Git detection -- branch name and dirty file count badge in workspace header
 - Right panel is drag-resizable
 - Syntax highlighted code preview (Prism.js)
+
+### Hermes Projects (shared with Desktop/CLI)
+The workspace picker also lists the profile's **Hermes Projects** — the shared
+store (`projects.db`) used by Hermes Desktop and `hermes project` on the CLI.
+- **Registration is opt-in.** The New Workspace form has a "Register as Hermes
+  Project" checkbox; leaving it unchecked creates a WebUI-local workspace
+  exactly as before. Checking it registers the folder in `projects.db` (the
+  profile's DB is initialized automatically if it doesn't exist yet) AND adds
+  the workspace locally, so Desktop and the CLI see it too.
+- **The shared store is authoritative for a path it owns.** Projects created
+  from Desktop/CLI appear in the picker without any WebUI action; their
+  display name comes from `projects.db`, and renaming or removing them from
+  the WebUI propagates there.
+- **Remove archives the shared project.** Removing a workspace whose folder
+  belongs to a Hermes Project archives the project in `projects.db` (soft
+  delete — it can be restored from Desktop/CLI). Local-only workspaces are
+  unaffected. If the shared store can't be written or read, the operation
+  fails cleanly instead of half-applying.
+- **Kill switch:** set `HERMES_WEBUI_PROJECTS_DB_SYNC=0` to disable the
+  bridge entirely; the picker then behaves exactly as before (local list only).
 
 ### Voice input
 - Microphone button in the composer (Web Speech API)
