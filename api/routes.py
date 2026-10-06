@@ -7049,7 +7049,7 @@ def _normalize_provider_id(value: str | None) -> str:
             return normalized
     # Unknown prefix — return empty so callers treat it as "no match" and pass
     # the model through unchanged rather than incorrectly stripping it.
-    return ""
+    return "" 
 
 
 def _catalog_provider_id_sets(catalog: dict) -> tuple[set[str], set[str]]:
@@ -28439,7 +28439,7 @@ def _handle_workspace_rename(handler, body):
         from api.projects_bridge import merge_hermes_projects, rename_hermes_project
         result = rename_hermes_project(path_str, name)
         if not result.get("renamed"):
-            if result.get("reason") in ("not-found", "no-db"):
+            if result.get("reason") in ("not-found", "no-db", "disabled"):
                 return bad(handler, "Workspace not found", 404)
             # DB owns the path but the writer failed (unavailable manager,
             # driver error): a 200 here would be undone by the next GET.

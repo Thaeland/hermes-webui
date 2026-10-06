@@ -12,6 +12,7 @@ import pytest
 
 from api.projects_bridge import (
     load_hermes_project_workspaces,
+    load_project_state,
     merge_hermes_projects,
     _cache,
 )
@@ -427,15 +428,19 @@ def test_failed_query_is_not_cached_and_reports_unknown(tmp_path):
     entries, archived, ok = load_project_state(profile_home=tmp_path)
     assert ok and len(entries) == 1
     # Corrupt the DB in place WITHOUT changing mtime: query now fails.
+    # Capture the stamps BEFORE writing: reading st_mtime after the write
+    # would already reflect the new stamp, so restoring it would be a no-op
+    # and a coarse-timestamp FS could flip the outcome of this test.
     real = db.read_bytes()
+    st = db.stat()
     db.write_bytes(b"not a database" * 10)
     import os
-    os.utime(db, (db.stat().st_atime, db.stat().st_mtime))  # keep same stamp
+    os.utime(db, (st.st_atime, st.st_mtime))  # keep the ORIGINAL stamp
     entries, archived, ok = load_project_state(profile_home=tmp_path)
     assert ok is False and entries == []
-    # Restore: same mtime, but the failure was never cached -> recovers.
+    # Restore: same original mtime, but the failure was never cached -> recovers.
     db.write_bytes(real)
-    os.utime(db, (db.stat().st_atime, db.stat().st_mtime))
+    os.utime(db, (st.st_atime, st.st_mtime))
     entries, archived, ok = load_project_state(profile_home=tmp_path)
     assert ok is True and {(e["path"], e["name"]) for e in entries} == {("/srv/a", "A")}
 
@@ -493,3 +498,51 @@ def test_wal_mtime_masking(tmp_path):
         assert {e["path"] for e in entries} == {"/srv/a", "/srv/b", "/srv/c"}
     finally:
         writer.close()
+
+
+
+# ── Greptile round 2: archived re-add, kill-switch writes ─────────────────
+
+
+def test_readded_workspace_at_archived_path_stays_visible(tmp_path):
+    """Greptile P1: after a project is archived, a workspace the user
+    deliberately re-adds at that path under its OWN name must remain in the
+    merged list (hiding every row at an archived path would make the new
+    local workspace vanish with nothing to re-append it)."""
+    db = _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "Old Name", "folders": ["/srv/a"], "archived": 1},
+    ])
+    _cache.clear()
+    local = [{"path": "/srv/a", "name": "My Re-added Space"}]
+    merged = merge_hermes_projects(local, profile_home=tmp_path)
+    assert merged == local  # kept, untouched, not hidden
+
+
+def test_archived_mirror_same_name_still_hidden(tmp_path):
+    """The mirror case (local row carries the archived project's name) must
+    still be hidden — that is the row Desktop/CLI retired."""
+    db = _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "Shared Name", "folders": ["/srv/a"], "archived": 1},
+    ])
+    _cache.clear()
+    merged = merge_hermes_projects([{"path": "/srv/a", "name": "Shared Name"}], profile_home=tmp_path)
+    assert merged == []
+
+
+def test_kill_switch_blocks_writes(tmp_path, monkeypatch):
+    """Greptile P2: HERMES_WEBUI_PROJECTS_DB_SYNC=0 must mean the shared
+    store is never touched — archive/rename return a 'disabled' no-op and
+    create refuses, instead of silently mutating projects.db."""
+    db = _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    monkeypatch.setenv("HERMES_WEBUI_PROJECTS_DB_SYNC", "0")
+    assert archive_hermes_project("/srv/a", profile_home=tmp_path) == {"archived": False, "reason": "disabled"}
+    assert rename_hermes_project("/srv/a", "B", profile_home=tmp_path) == {"renamed": False, "reason": "disabled"}
+    with pytest.raises(RuntimeError, match="disabled"):
+        create_hermes_project("/srv/b", "B", profile_home=tmp_path)
+    # DB untouched: still one active project named A.
+    monkeypatch.setenv("HERMES_WEBUI_PROJECTS_DB_SYNC", "1")
+    _cache.clear()
+    entries, archived, ok = load_project_state(profile_home=tmp_path)
+    assert ok and [(e["path"], e["name"]) for e in entries] == [("/srv/a", "A")]
