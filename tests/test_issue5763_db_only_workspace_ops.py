@@ -70,9 +70,13 @@ def _clear_bridge_cache():
 def db_only(tmp_path, monkeypatch):
     """A projects.db in a fake profile home + a DB-only project dir outside home.
 
-    tmp_path is under /tmp (never under the user's home), so the DB-only path
-    exercises the (B)/(B2) trust branches rather than the under-home shortcut.
+    ``_home_path`` is pinned to an empty dir under tmp_path so the candidate
+    is genuinely OUTSIDE home: pytest's tmp_path lives under $TMPDIR, which
+    on some hosts (e.g. TMPDIR under $HOME) would otherwise make rule (A)
+    ("under home is trusted") return the candidate and silently bypass the
+    (B)/(B2) trust branches these tests exist to cover.
     """
+    monkeypatch.setattr("api.workspace._home_path", lambda: tmp_path / "pinning-not-home")
     outside = tmp_path / "srv" / "dbonly-project"
     outside.mkdir(parents=True)
     _make_projects_db(tmp_path, [
@@ -91,6 +95,9 @@ def test_trust_accepts_db_only_project_outside_home(db_only):
 
 
 def test_trust_still_rejects_unknown_path_outside_home(tmp_path, monkeypatch):
+    # Pin home (see db_only fixture): under a $TMPDIR inside $HOME, rule (A)
+    # would trust tmp_path and the rejection would never be exercised.
+    monkeypatch.setattr("api.workspace._home_path", lambda: tmp_path / "pinning-not-home")
     stranger = tmp_path / "srv" / "not-a-project"
     stranger.mkdir(parents=True)
     monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: tmp_path)
@@ -100,6 +107,7 @@ def test_trust_still_rejects_unknown_path_outside_home(tmp_path, monkeypatch):
 
 
 def test_trust_rejects_archived_project(tmp_path, monkeypatch):
+    monkeypatch.setattr("api.workspace._home_path", lambda: tmp_path / "pinning-not-home")
     gone = tmp_path / "srv" / "archived-project"
     gone.mkdir(parents=True)
     _make_projects_db(tmp_path, [
