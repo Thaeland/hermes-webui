@@ -25,7 +25,6 @@ import os
 import sqlite3
 import sys
 import threading
-import time
 import urllib.parse
 from pathlib import Path
 
@@ -248,7 +247,7 @@ def _create_via_subprocess(db: Path, *, name: str, resolved: str) -> dict:
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise RuntimeError(f"project create subprocess failed: {e}")
+        raise RuntimeError(f"project create subprocess failed: {e}") from e
     out = (proc.stdout or "").strip().splitlines()
     payload = None
     for line in reversed(out):

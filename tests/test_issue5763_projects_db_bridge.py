@@ -4,7 +4,6 @@ The bridge must be read-only and fail-safe: a present projects.db surfaces
 Hermes Projects in the workspace list; a missing/corrupt DB leaves the
 workspaces.json behavior exactly as before.
 """
-import json
 import sqlite3
 import time
 from pathlib import Path
