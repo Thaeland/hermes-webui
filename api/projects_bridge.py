@@ -1,19 +1,25 @@
-"""Read-only bridge from the Hermes Agent Projects store (projects.db).
+"""Bridge between the WebUI workspace picker and the Hermes Agent Projects
+store (projects.db).
 
-Implements the read-path slice of issue #5763: the WebUI workspace list
-surfaces the profile's authoritative ``projects.db`` (the same SQLite store
-backing Hermes Desktop / CLI ``hermes project list``) instead of requiring a
-manually duplicated picker list.
+Implements issue #5763: the WebUI workspace list surfaces the profile's
+authoritative ``projects.db`` (the same SQLite store backing Hermes Desktop /
+CLI ``hermes project list``) instead of requiring a manually duplicated
+picker list, and the write slice (create / archive / rename) propagates
+WebUI project operations into ``projects.db`` so Desktop/CLI see them too.
 
-Design (per the maintainer's recommended first slice):
-- In-process read only. No writes ever touch ``projects.db``; the WebUI keeps
-  owning ``workspaces.json`` for its own additions.
-- Fail-safe by contract: a missing DB, missing tables, lock contention, or any
-  other error yields an empty list — the workspace picker then behaves exactly
-  as it did before this bridge existed (``workspaces.json`` fallback).
-- Results are cached per DB path and invalidated on file mtime change, so a
-  project created via Desktop/CLI appears on the next ``/api/workspaces``
-  poll without a WebUI restart.
+Design:
+- Reads are fail-safe by contract: a missing DB, missing tables, lock
+  contention, or any other error yields an empty result with ``read_ok``
+  telling callers whether the answer is authoritative — the workspace picker
+  then behaves exactly as it did before this bridge existed
+  (``workspaces.json`` fallback).
+- Writes go through the upstream ``hermes_cli.projects_db`` module when
+  importable (same code path as ``hermes project create``), with a
+  schema-compatible subprocess fallback. The ``HERMES_WEBUI_PROJECTS_DB_SYNC``
+  kill switch disables reads AND writes.
+- Read results are cached per DB path and invalidated on DB/WAL mtime+size
+  change, so a project created via Desktop/CLI appears on the next
+  ``/api/workspaces`` poll without a WebUI restart.
 """
 
 from __future__ import annotations
@@ -30,8 +36,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# path -> ((db_mtime, wal_mtime), active_entries, archived_paths)
-_cache: dict[str, tuple[tuple[float | None, float | None], list[tuple[str, str]], set[str]]] = {}
+# path -> ((db stat, wal stat), active_entries, archived_by_path)
+_cache: dict[
+    str,
+    tuple[tuple[tuple[float, int] | None, tuple[float, int] | None], list[tuple[str, str]], dict[str, str]],
+] = {}
 _cache_lock = threading.Lock()
 
 # Env kill-switch: set HERMES_WEBUI_PROJECTS_DB_SYNC=0 to disable the bridge.
@@ -40,6 +49,29 @@ _DISABLE_ENV = "HERMES_WEBUI_PROJECTS_DB_SYNC"
 
 def _sync_enabled() -> bool:
     return os.environ.get(_DISABLE_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def path_key(path: str | Path) -> str:
+    """Canonical comparison key for a workspace/project path.
+
+    Both sides of every bridge comparison go through this. Local
+    ``workspaces.json`` rows are stored symlink-resolved
+    (``validate_workspace_to_add``), while ``projects.db`` rows are stored as
+    Desktop/CLI wrote them — possibly a symlinked or differently-cased
+    spelling of the same directory. Comparing raw strings lets one directory
+    look like two paths: a shared-backed workspace misclassified as
+    local-only silently reverts on the next poll (deep-audit P1).
+
+    ``realpath`` folds symlinks (and, on case-insensitive filesystems, the
+    on-disk casing); ``normcase`` covers Windows case-folding. Trailing
+    separators are stripped so ``/x`` and ``/x/`` compare equal.
+    """
+    s = str(path).strip()
+    try:
+        return os.path.normcase(os.path.realpath(os.path.expanduser(s))).rstrip("/\\")
+    except (OSError, ValueError):
+        # Embedded NUL or pathological input: fall back to the lexical form.
+        return os.path.normcase(os.path.abspath(os.path.expanduser(s))).rstrip("/\\")
 
 
 def _projects_db_path(profile_home: Path | None) -> Path | None:
@@ -63,9 +95,9 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
     attached folder (lowest ``added_at`` for determinism). Projects with no
     folders at all are skipped: a workspace entry needs a real directory.
 
-    Archived projects are returned as ``path -> name`` so the merge can hide
-    local MIRROR rows whose shared project was archived from Desktop/CLI —
-    while still showing a workspace the user deliberately re-added under its
+    Archived projects are returned as ``path_key -> {names}`` so the merge can
+    hide local MIRROR rows whose shared project was archived from Desktop/CLI
+    — while still showing a workspace the user deliberately re-added under its
     own name after the archive (see merge_hermes_projects).
 
     Raises sqlite.Error on any read failure (missing tables, lock, corrupt
@@ -98,7 +130,7 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
         conn.close()
 
     out: list[tuple[str, str]] = []
-    archived: dict[str, str] = {}
+    archived: dict[str, set[str]] = {}
     seen: set[str] = set()
     for r in rows:
         path = (r["path"] or "").strip()
@@ -106,7 +138,10 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
         if not path:
             continue
         if r["archived"]:
-            archived.setdefault(path, name)
+            # A set of names: two archived projects can share a path (archive
+            # one, re-create at the same dir, archive again) and every mirror
+            # name must be hidden, not just the oldest one's (deep-audit P3).
+            archived.setdefault(path_key(path), set()).add(name)
             continue
         if not name or path in seen:
             continue
@@ -115,7 +150,7 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
     return out, archived
 
 
-def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], dict[str, str], bool]:
+def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], dict[str, set[str]], bool]:
     """Return ``(active_entries, archived_by_path, read_ok)`` from projects.db.
 
     ``read_ok`` is False when the DB exists but could not be read (lock,
@@ -126,30 +161,39 @@ def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], di
     re-queries, so a transient error self-heals without waiting for a
     timestamp change.
 
-    The cache key tracks the DB and WAL mtimes SEPARATELY: a max() of the two
-    lets a newer main-DB timestamp mask a WAL commit (future-dated restore,
-    coarse-timestamp filesystems), leaving stale entries cached.
+    ``archived_by_path`` maps ``path_key`` to the SET of archived project
+    names at that path — always a dict, on every path, including the
+    kill-switch and no-DB shortcuts (callers may rely on the mapping shape).
+
+    The cache key tracks the DB and WAL (mtime, size) SEPARATELY: a max() of
+    the two lets a newer main-DB timestamp mask a WAL commit (future-dated
+    restore, coarse-timestamp filesystems), and mtime alone misses a commit
+    that lands inside the filesystem's timestamp granularity of the stat
+    whose result got cached — size catches every row insert/delete.
     """
     if not _sync_enabled():
-        return [], set(), True
+        return [], {}, True
     try:
         db = _projects_db_path(profile_home)
         if db is None:
             # No shared store at all: trivially "read fine, nothing there".
-            return [], set(), True
+            return [], {}, True
         key = str(db)
-        try:
-            db_mtime = db.stat().st_mtime
-            wal = db.with_name(db.name + "-wal")
+
+        def _stamp(p: Path) -> tuple[float, int] | None:
             try:
-                wal_mtime: float | None = wal.stat().st_mtime
+                st = p.stat()
+                return (st.st_mtime, st.st_size)
             except OSError:
-                wal_mtime = None
-        except OSError:
-            return [], set(), True
+                return None
+
+        db_stamp = _stamp(db)
+        if db_stamp is None:
+            return [], {}, True
+        wal_stamp = _stamp(db.with_name(db.name + "-wal"))
         with _cache_lock:
             cached = _cache.get(key)
-            if cached is not None and cached[0] == (db_mtime, wal_mtime):
+            if cached is not None and cached[0] == (db_stamp, wal_stamp):
                 entries, archived = cached[1], cached[2]
             else:
                 try:
@@ -157,16 +201,16 @@ def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], di
                 except sqlite3.Error as e:
                     # Failed read: never cache, report unknown.
                     logger.debug("projects.db read failed (not cached): %s", e)
-                    return [], set(), False
-                _cache[key] = ((db_mtime, wal_mtime), entries, archived)
+                    return [], {}, False
+                _cache[key] = ((db_stamp, wal_stamp), entries, archived)
         return (
             [{"path": p, "name": n, "source": "hermes_project"} for p, n in entries],
-            dict(archived),
+            {k: set(v) for k, v in archived.items()},
             True,
         )
     except Exception:
         logger.debug("projects.db bridge failed; falling back to local workspaces", exc_info=True)
-        return [], set(), False
+        return [], {}, False
 
 
 def load_hermes_project_workspaces(profile_home: Path | None = None) -> list[dict]:
@@ -203,25 +247,32 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
         return list(workspaces)
     if not db_entries and not archived:
         return list(workspaces)
-    db_by_path = {e["path"]: e for e in db_entries}
+    db_by_path = {path_key(e["path"]): e for e in db_entries}
     merged: list[dict] = []
     used: set[str] = set()
     for w in workspaces:
         entry = dict(w)
         path = entry.get("path", "")
-        arch_name = archived.get(path)
-        if arch_name is not None and (entry.get("name") or "").strip() == arch_name:
+        key = path_key(path)
+        arch_names = archived.get(key)
+        if (
+            arch_names is not None
+            and (entry.get("name") or "").strip()
+            and (entry.get("name") or "").strip() in arch_names
+        ):
             # Local mirror of a retired shared project: hide it. A local row
-            # with a DIFFERENT name is a deliberate re-add, not a mirror.
+            # with a DIFFERENT (or empty) name is a deliberate re-add, not a
+            # mirror — and a blank name must never match an archived project
+            # that itself has no name (deep-audit P3 empty-name asymmetry).
             continue
-        hit = db_by_path.get(path)
+        hit = db_by_path.get(key)
         if hit is not None:
             entry["name"] = hit["name"]
             entry["source"] = "hermes_project"
-            used.add(hit["path"])
+            used.add(key)
         merged.append(entry)
     for e in db_entries:
-        if e["path"] not in used:
+        if path_key(e["path"]) not in used:
             merged.append(dict(e))
     return merged
 
@@ -429,15 +480,27 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
 # possible; _query_projects only surfaces non-archived rows).
 
 _ARCHIVE_PROJECT_PROG = """
-import json, sys
+import json, os, sys
 db_path, path, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, agent_dir)
+def _key(p):
+    try:
+        return os.path.normcase(os.path.realpath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.abspath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
 try:
     from hermes_cli import projects_db as pdb
     from pathlib import Path
     conn = pdb.connect(db_path=Path(db_path))
     try:
-        proj = pdb.find_by_primary_path(conn, path)
+        key = _key(path)
+        proj = None
+        for p_ in pdb.list_projects(conn):
+            primary = p_.primary_path or next(
+                (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
+            if primary and _key(primary) == key:
+                proj = p_
+                break
         if proj is None:
             print(json.dumps({"ok": True, "archived": False, "reason": "not-found"}))
         else:
@@ -451,6 +514,26 @@ except Exception as e:
 """
 
 
+def _find_project_by_path(pdb, conn, path: str):
+    """Upstream ``find_by_primary_path`` matched through ``path_key``.
+
+    Upstream compares lexically (normcase/abspath), so a DB row stored under
+    a symlinked spelling of the directory the WebUI resolved would not be
+    found and the archive/rename would silently no-op while the route already
+    classified the path as shared-backed (deep-audit P1). Same traversal as
+    upstream, canonical keys on both sides.
+    """
+    key = path_key(path)
+    for proj in pdb.list_projects(conn, include_archived=False):
+        primary = proj.primary_path or next(
+            (f.path for f in proj.folders if f.is_primary),
+            proj.folders[0].path if proj.folders else None,
+        )
+        if primary and path_key(primary) == key:
+            return proj
+    return None
+
+
 def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
     """Archive the projects.db project owning ``path`` (if any).
 
@@ -462,7 +545,7 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
     if not _sync_enabled():
         # Kill switch: the shared store must stay untouched, writes included.
         return {"archived": False, "reason": "disabled"}
-    resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
+    resolved = path_key(path)
     db = _projects_db_path(profile_home)
     if db is None:
         return {"archived": False, "reason": "no-db"}
@@ -471,7 +554,7 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
         try:
             conn = pdb.connect(db_path=db)
             try:
-                proj = pdb.find_by_primary_path(conn, resolved)
+                proj = _find_project_by_path(pdb, conn, resolved)
                 if proj is None:
                     return {"archived": False, "reason": "not-found"}
                 ok = pdb.archive_project(conn, proj.id)
@@ -521,15 +604,27 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
 # new name to the DB (fail-safe, same contract as archive).
 
 _RENAME_PROJECT_PROG = """
-import json, sys
+import json, os, sys
 db_path, path, name, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sys.path.insert(0, agent_dir)
+def _key(p):
+    try:
+        return os.path.normcase(os.path.realpath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.abspath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
 try:
     from hermes_cli import projects_db as pdb
     from pathlib import Path
     conn = pdb.connect(db_path=Path(db_path))
     try:
-        proj = pdb.find_by_primary_path(conn, path)
+        key = _key(path)
+        proj = None
+        for p_ in pdb.list_projects(conn):
+            primary = p_.primary_path or next(
+                (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
+            if primary and _key(primary) == key:
+                proj = p_
+                break
         if proj is None:
             print(json.dumps({"ok": True, "renamed": False, "reason": "not-found"}))
         else:
@@ -556,7 +651,7 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     name = (name or "").strip()
     if not name:
         return {"renamed": False, "reason": "empty-name"}
-    resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
+    resolved = path_key(path)
     db = _projects_db_path(profile_home)
     if db is None:
         return {"renamed": False, "reason": "no-db"}
@@ -565,7 +660,7 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
         try:
             conn = pdb.connect(db_path=db)
             try:
-                proj = pdb.find_by_primary_path(conn, resolved)
+                proj = _find_project_by_path(pdb, conn, resolved)
                 if proj is None:
                     return {"renamed": False, "reason": "not-found"}
                 ok = pdb.update_project(conn, proj.id, name=name)

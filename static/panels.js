@@ -6394,7 +6394,11 @@ async function saveWorkspaceForm(){
       renderWorkspacesPanel(_workspaceList);
       const proj = data.project || {};
       showToast(proj.error ? (t('error_prefix') + proj.error) : (t('workspace_project_created') || 'Hermes Project created'));
-      const added = _workspaceList.find(w => w.path === path) || _workspaceList[_workspaceList.length - 1];
+      // Match on the server-normalized path (proj.path): the user may have
+      // typed '~/x' or a trailing slash, which never equals the stored row,
+      // and the last-element fallback would open a DB-only neighbor instead.
+      const want = proj.path || path;
+      const added = _workspaceList.find(w => w.path === want) || _workspaceList.find(w => w.path === path);
       if (added) openWorkspaceDetail(added.path);
       return;
     }

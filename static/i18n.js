@@ -14820,6 +14820,8 @@ const LOCALES = {
     workspace_sort_created_desc: 'Data de criação (mais recentes primeiro)',
     workspace_sort_modified_desc: 'Data de modificação (mais recentes primeiro)',
     workspace_sort_created_unavailable: 'A hora de criação não é informada por este servidor ou plataforma.',
+    workspace_as_hermes_project: 'Registrar como Projeto Hermes (compartilhado com Desktop/CLI)',
+    workspace_project_created: 'Projeto Hermes criado',
     workspace_show_hidden_files_desc: 'Include .DS_Store, .git, node_modules, and other hidden / system files in the file tree.',
     workspace_panel_show: 'Show workspace panel',
     workspace_panel_hide: 'Hide workspace panel',

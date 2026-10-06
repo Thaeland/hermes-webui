@@ -7049,7 +7049,7 @@ def _normalize_provider_id(value: str | None) -> str:
             return normalized
     # Unknown prefix — return empty so callers treat it as "no match" and pass
     # the model through unchanged rather than incorrectly stripping it.
-    return "" 
+    return ""
 
 
 def _catalog_provider_id_sets(catalog: dict) -> tuple[set[str], set[str]]:
@@ -28326,12 +28326,13 @@ def _handle_workspace_create_project(handler, body):
         return bad(handler, _sanitize_error(e))
     # 2) Ensure the local picker list has it too (harmless if the read bridge
     # already surfaces it; save_workspaces dedupe keeps this cheap).
-    from api.projects_bridge import merge_hermes_projects
+    from api.projects_bridge import merge_hermes_projects, path_key as _path_key
     try:
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
-    if not any(w["path"] == str(p) for w in wss):
+    new_key = _path_key(str(p))
+    if not any(_path_key(w.get("path", "")) == new_key for w in wss):
         wss.append({"path": str(p), "name": project_name})
         try:
             save_workspaces(wss, profile=active_profile)
@@ -28350,18 +28351,19 @@ def _handle_workspace_remove(handler, body):
         return bad(handler, "path is required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
-    # Resolve once and use the same string for the local filter and the DB
-    # archive: the bridge normalizes (abspath/expanduser) while the local
-    # filter was an exact match, so a "~/x" or trailing-slash variant could
-    # archive the shared project while leaving the local entry behind.
-    import os as _os
-    resolved_path = _os.path.abspath(_os.path.expanduser(path_str)).rstrip("/\\")
+    # Resolve once and use the same key for the local filter and the DB
+    # archive: the bridge canonicalizes (realpath/expanduser/case) while the
+    # local filter was an exact match, so a "~/x", trailing-slash, or
+    # symlinked variant could archive the shared project while leaving the
+    # local entry behind.
+    from api.projects_bridge import path_key as _path_key
+    resolved_path = _path_key(path_str)
     try:
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
     def _same_path(a: str, b: str) -> bool:
-        return _os.path.abspath(_os.path.expanduser(str(a).strip())).rstrip("/\\") == resolved_path
+        return _path_key(a) == _path_key(b)
     # Decide shared-backed BEFORE mutating local state: if the picker entry
     # comes from projects.db, the DB archive must succeed first — otherwise
     # the local removal would report success while the next GET restores the
@@ -28377,10 +28379,7 @@ def _handle_workspace_remove(handler, body):
     if not read_ok:
         return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.")
     try:
-        db_paths = {
-            _os.path.abspath(_os.path.expanduser(str(e["path"]).strip())).rstrip("/\\")
-            for e in _entries if e.get("path")
-        }
+        db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
     except Exception:
         db_paths = set()
     shared_backed = resolved_path in db_paths
@@ -28428,8 +28427,10 @@ def _handle_workspace_rename(handler, body):
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
+    from api.projects_bridge import path_key as _path_key
+    target_key = _path_key(path_str)
     for w in wss:
-        if w["path"] == path_str:
+        if _path_key(w.get("path", "")) == target_key:
             w["name"] = name
             break
     else:
@@ -28456,17 +28457,13 @@ def _handle_workspace_rename(handler, body):
     # rename must not commit a local name the next GET would revert
     # (re-gate finding 2). A failed ownership read is unknown, not proof
     # of local-only (greptile P1): fail closed.
-    import os as _os
-    resolved_path = _os.path.abspath(_os.path.expanduser(path_str)).rstrip("/\\")
-    from api.projects_bridge import load_project_state, merge_hermes_projects, rename_hermes_project
+    from api.projects_bridge import load_project_state, merge_hermes_projects, path_key as _path_key, rename_hermes_project
+    resolved_path = _path_key(path_str)
     _entries, _archived, read_ok = load_project_state()
     if not read_ok:
         return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.", 500)
     try:
-        db_paths = {
-            _os.path.abspath(_os.path.expanduser(str(e["path"]).strip())).rstrip("/\\")
-            for e in _entries if e.get("path")
-        }
+        db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
     except Exception:
         db_paths = set()
     shared_backed = resolved_path in db_paths
@@ -28509,35 +28506,37 @@ def _handle_workspace_reorder(handler, body):
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
-    by_path = {w["path"]: w for w in wss}
     # DB-only projects (projects.db, not in workspaces.json) appear in the
     # picker via the read bridge; without a local row their dragged position
     # cannot persist and the response silently drops them. Materialize a local
     # row for any requested path the DB owns.
-    from api.projects_bridge import load_hermes_project_workspaces, merge_hermes_projects
-    import os as _os
-    def _norm(p: str) -> str:
-        return _os.path.abspath(_os.path.expanduser(str(p).strip())).rstrip("/\\")
+    from api.projects_bridge import load_hermes_project_workspaces, merge_hermes_projects, path_key as _path_key
     db_by_path = {}
     try:
-        db_by_path = {_norm(e["path"]): e for e in load_hermes_project_workspaces()}
+        db_by_path = {_path_key(e["path"]): e for e in load_hermes_project_workspaces()}
     except Exception:
         pass
     reordered = []
-    seen = set()
+    seen: set[str] = set()
     for p in paths:
         p = p.strip()
-        if p in by_path and p not in seen:
-            reordered.append(by_path[p])
-            seen.add(p)
-        elif p not in seen and _norm(p) in db_by_path:
-            entry = db_by_path[_norm(p)]
+        key = _path_key(p)
+        if key in seen:
+            # Same directory under two spellings ('/x/p' and '/x/p/'): the
+            # first wins; a second row would persist a duplicate (deep-audit P2).
+            continue
+        local_hit = next((w for w in wss if _path_key(w.get("path", "")) == key), None)
+        if local_hit is not None:
+            reordered.append(local_hit)
+            seen.add(key)
+        elif key in db_by_path:
+            entry = db_by_path[key]
             row = {"path": entry["path"], "name": entry["name"]}
             reordered.append(row)
-            seen.add(p)
+            seen.add(key)
     # Append any workspaces not mentioned (safety net)
     for w in wss:
-        if w["path"] not in seen:
+        if _path_key(w.get("path", "")) not in seen:
             reordered.append(w)
     try:
         save_workspaces(reordered, profile=active_profile)
