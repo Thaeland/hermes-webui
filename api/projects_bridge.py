@@ -494,19 +494,20 @@ try:
     conn = pdb.connect(db_path=Path(db_path))
     try:
         key = _key(path)
-        proj = None
-        for p_ in pdb.list_projects(conn):
+        matches = []
+        for p_ in pdb.list_projects(conn, include_archived=False):
             primary = p_.primary_path or next(
                 (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
             if primary and _key(primary) == key:
-                proj = p_
-                break
-        if proj is None:
+                matches.append(p_)
+        if not matches:
             print(json.dumps({"ok": True, "archived": False, "reason": "not-found"}))
+        elif len(matches) > 1:
+            print(json.dumps({"ok": True, "archived": False, "reason": "ambiguous-path", "count": len(matches)}))
         else:
-            ok = pdb.archive_project(conn, proj.id)
+            ok = pdb.archive_project(conn, matches[0].id)
             conn.commit()
-            print(json.dumps({"ok": True, "archived": bool(ok), "id": proj.id}))
+            print(json.dumps({"ok": True, "archived": bool(ok), "id": matches[0].id}))
     finally:
         conn.close()
 except Exception as e:
@@ -514,24 +515,31 @@ except Exception as e:
 """
 
 
-def _find_project_by_path(pdb, conn, path: str):
-    """Upstream ``find_by_primary_path`` matched through ``path_key``.
+def _find_projects_by_path(pdb, conn, path: str):
+    """All non-archived projects whose primary path canonicalizes to ``path``.
 
-    Upstream compares lexically (normcase/abspath), so a DB row stored under
-    a symlinked spelling of the directory the WebUI resolved would not be
-    found and the archive/rename would silently no-op while the route already
-    classified the path as shared-backed (deep-audit P1). Same traversal as
-    upstream, canonical keys on both sides.
+    Upstream ``find_by_primary_path`` matched lexically (normcase/abspath), so
+    a DB row stored under a symlinked spelling of the directory the WebUI
+    resolved would not be found and the archive/rename would silently no-op
+    while the route already classified the path as shared-backed (deep-audit
+    P1). Same traversal as upstream, canonical keys on both sides.
+
+    Returns a LIST because Desktop/CLI can register two projects over the same
+    directory through different spellings (real path + symlink). Callers must
+    treat 0 matches as not-found and >1 as ambiguous (greptile P1: acting on
+    the first match could mutate a different project than the one the picker
+    shows, since the merge collapses same-key rows into one entry).
     """
     key = path_key(path)
+    matches = []
     for proj in pdb.list_projects(conn, include_archived=False):
         primary = proj.primary_path or next(
             (f.path for f in proj.folders if f.is_primary),
             proj.folders[0].path if proj.folders else None,
         )
         if primary and path_key(primary) == key:
-            return proj
-    return None
+            matches.append(proj)
+    return matches
 
 
 def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
@@ -554,9 +562,17 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
         try:
             conn = pdb.connect(db_path=db)
             try:
-                proj = _find_project_by_path(pdb, conn, resolved)
-                if proj is None:
+                matches = _find_projects_by_path(pdb, conn, resolved)
+                if not matches:
                     return {"archived": False, "reason": "not-found"}
+                if len(matches) > 1:
+                    # Ambiguous owner: the picker shows one collapsed entry for
+                    # this path, but the DB has several projects behind it.
+                    # Refuse rather than archive a project the user did not
+                    # target (greptile P1).
+                    return {"archived": False, "reason": "ambiguous-path",
+                            "count": len(matches)}
+                proj = matches[0]
                 ok = pdb.archive_project(conn, proj.id)
                 conn.commit()
             finally:
@@ -618,19 +634,20 @@ try:
     conn = pdb.connect(db_path=Path(db_path))
     try:
         key = _key(path)
-        proj = None
-        for p_ in pdb.list_projects(conn):
+        matches = []
+        for p_ in pdb.list_projects(conn, include_archived=False):
             primary = p_.primary_path or next(
                 (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
             if primary and _key(primary) == key:
-                proj = p_
-                break
-        if proj is None:
+                matches.append(p_)
+        if not matches:
             print(json.dumps({"ok": True, "renamed": False, "reason": "not-found"}))
+        elif len(matches) > 1:
+            print(json.dumps({"ok": True, "renamed": False, "reason": "ambiguous-path", "count": len(matches)}))
         else:
-            ok = pdb.update_project(conn, proj.id, name=name)
+            ok = pdb.update_project(conn, matches[0].id, name=name)
             conn.commit()
-            print(json.dumps({"ok": True, "renamed": bool(ok), "id": proj.id}))
+            print(json.dumps({"ok": True, "renamed": bool(ok), "id": matches[0].id}))
     finally:
         conn.close()
 except Exception as e:
@@ -660,9 +677,14 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
         try:
             conn = pdb.connect(db_path=db)
             try:
-                proj = _find_project_by_path(pdb, conn, resolved)
-                if proj is None:
+                matches = _find_projects_by_path(pdb, conn, resolved)
+                if not matches:
                     return {"renamed": False, "reason": "not-found"}
+                if len(matches) > 1:
+                    # Ambiguous owner — see archive_hermes_project.
+                    return {"renamed": False, "reason": "ambiguous-path",
+                            "count": len(matches)}
+                proj = matches[0]
                 ok = pdb.update_project(conn, proj.id, name=name)
                 conn.commit()
             finally:

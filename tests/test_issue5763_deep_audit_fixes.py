@@ -29,6 +29,7 @@ from api.projects_bridge import (
     load_project_state,
     merge_hermes_projects,
     path_key,
+    rename_hermes_project,
 )
 
 
@@ -251,3 +252,84 @@ def test_register_as_project_checkbox_unchecked_by_default():
     for line in src.splitlines():
         if 'id="workspaceFormAsProject"' in line:
             assert "checked" not in line, f"checkbox must default to unchecked: {line.strip()}"
+
+
+# ── greptile P1: distinct projects sharing one canonical path ───────────────
+
+
+def test_archive_refuses_ambiguous_path(tmp_path):
+    """Two DB projects whose primary paths canonicalize to the same directory
+    (real path + symlink spelling) collapse to one picker entry. Archive must
+    refuse rather than pick one — the user targeted 'the folder', not one of
+    two distinct shared projects behind it."""
+    real = tmp_path / "srv" / "proj"
+    real.mkdir(parents=True)
+    link = tmp_path / "srv" / "link"
+    link.symlink_to(real)
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "Proj A", "folders": [str(real)]},
+        {"id": "p2", "slug": "b", "name": "Proj B", "folders": [str(link)]},
+    ])
+    result = archive_hermes_project(str(real), profile_home=tmp_path)
+    assert result.get("archived") is False
+    assert result.get("reason") == "ambiguous-path"
+    assert result.get("count") == 2
+    # Neither project was touched: both still active.
+    entries, _arch, ok = load_project_state(profile_home=tmp_path)
+    assert ok and len(entries) == 2
+
+
+def test_rename_refuses_ambiguous_path(tmp_path):
+    real = tmp_path / "srv" / "proj"
+    real.mkdir(parents=True)
+    link = tmp_path / "srv" / "link"
+    link.symlink_to(real)
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "Proj A", "folders": [str(real)]},
+        {"id": "p2", "slug": "b", "name": "Proj B", "folders": [str(link)]},
+    ])
+    result = rename_hermes_project(str(real), "Renamed", profile_home=tmp_path)
+    assert result.get("renamed") is False
+    assert result.get("reason") == "ambiguous-path"
+    entries, _arch, ok = load_project_state(profile_home=tmp_path)
+    assert ok and {e["name"] for e in entries} == {"Proj A", "Proj B"}
+
+
+def test_archive_single_match_still_works_after_ambiguity_check(tmp_path):
+    """Guard against the ambiguity check over-refusing: one project, one
+    spelling — archive still succeeds."""
+    real = tmp_path / "srv" / "proj"
+    real.mkdir(parents=True)
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "Proj", "folders": [str(real)]},
+    ])
+    result = archive_hermes_project(str(real), profile_home=tmp_path)
+    assert result.get("archived") is True
+
+
+def test_remove_ambiguous_path_fails_closed(tmp_path, monkeypatch):
+    """Route-level: an ambiguous shared path must surface an error, not
+    silently archive one of the two projects."""
+    from api.routes import _handle_workspace_remove
+
+    real = tmp_path / "srv" / "proj"
+    real.mkdir(parents=True)
+    link = tmp_path / "srv" / "link"
+    link.symlink_to(real)
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "Proj A", "folders": [str(real)]},
+        {"id": "p2", "slug": "b", "name": "Proj B", "folders": [str(link)]},
+    ])
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    saved = []
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[{"path": str(real), "name": "Proj A"}]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: saved.append(list(wss))):
+        _handle_workspace_remove(handler, {"path": str(real)})
+    assert not saved, "local workspaces must be untouched when the shared owner is ambiguous"
+    code = handler.send_response.call_args[0][0]
+    assert code != 200, f"remove must fail closed on ambiguity, got {code}"
+    # Both DB projects still active.
+    entries, _arch, ok = load_project_state(profile_home=tmp_path)
+    assert ok and len(entries) == 2
