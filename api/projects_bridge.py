@@ -56,16 +56,17 @@ def _projects_db_path(profile_home: Path | None) -> Path | None:
     return db if db.is_file() else None
 
 
-def _query_projects(db: Path) -> tuple[list[tuple[str, str]], set[str]]:
-    """Return ``(active_entries, archived_paths)`` for the profile's projects.
+def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """Return ``(active_entries, archived_by_path)`` for the profile's projects.
 
     A project's workspace path is its primary folder when set, otherwise any
     attached folder (lowest ``added_at`` for determinism). Projects with no
     folders at all are skipped: a workspace entry needs a real directory.
 
-    Archived paths are returned so the merge can also HIDE local mirror rows
-    whose shared project was archived from Desktop/CLI — otherwise the picker
-    keeps showing a project the shared store no longer considers active.
+    Archived projects are returned as ``path -> name`` so the merge can hide
+    local MIRROR rows whose shared project was archived from Desktop/CLI —
+    while still showing a workspace the user deliberately re-added under its
+    own name after the archive (see merge_hermes_projects).
 
     Raises sqlite.Error on any read failure (missing tables, lock, corrupt
     file): callers must distinguish "no projects" from "could not tell" —
@@ -97,7 +98,7 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], set[str]]:
         conn.close()
 
     out: list[tuple[str, str]] = []
-    archived: set[str] = set()
+    archived: dict[str, str] = {}
     seen: set[str] = set()
     for r in rows:
         path = (r["path"] or "").strip()
@@ -105,7 +106,7 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], set[str]]:
         if not path:
             continue
         if r["archived"]:
-            archived.add(path)
+            archived.setdefault(path, name)
             continue
         if not name or path in seen:
             continue
@@ -114,8 +115,8 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], set[str]]:
     return out, archived
 
 
-def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], set[str], bool]:
-    """Return ``(active_entries, archived_paths, read_ok)`` from projects.db.
+def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], dict[str, str], bool]:
+    """Return ``(active_entries, archived_by_path, read_ok)`` from projects.db.
 
     ``read_ok`` is False when the DB exists but could not be read (lock,
     corrupt file, older schema). Callers MUST treat a failed read as
@@ -160,7 +161,7 @@ def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], se
                 _cache[key] = ((db_mtime, wal_mtime), entries, archived)
         return (
             [{"path": p, "name": n, "source": "hermes_project"} for p, n in entries],
-            set(archived),
+            dict(archived),
             True,
         )
     except Exception:
@@ -185,9 +186,12 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
 
     - projects.db is authoritative for a path it owns: a local entry with the
       same path takes the project's display name.
-    - A local mirror row whose shared project was ARCHIVED (from Desktop/CLI)
-      is hidden: the shared store no longer considers the project active, so
-      the picker must not keep showing it.
+    - A local MIRROR row whose shared project was ARCHIVED (from Desktop/CLI)
+      is hidden — but only when it is actually the mirror: same name as the
+      archived project. A workspace the user deliberately re-added at that
+      path under its own name after the archive must stay visible (there is
+      no active DB entry to re-append it, so hiding it would make the new
+      workspace vanish).
     - Local-only entries keep their order and names (WebUI additions still work).
     - DB projects not present locally are appended.
     - A FAILED DB read is not authoritative: local entries pass through
@@ -205,8 +209,10 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     for w in workspaces:
         entry = dict(w)
         path = entry.get("path", "")
-        if path in archived:
-            # Shared project retired: hide the local mirror row too.
+        arch_name = archived.get(path)
+        if arch_name is not None and (entry.get("name") or "").strip() == arch_name:
+            # Local mirror of a retired shared project: hide it. A local row
+            # with a DIFFERENT name is a deliberate re-add, not a mirror.
             continue
         hit = db_by_path.get(path)
         if hit is not None:
@@ -358,6 +364,10 @@ def projects_db_openable(profile_home: Path | None = None) -> bool:
 def create_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
     """Create a Hermes Project for ``path`` in the profile's projects.db.
 
+    Honors the ``HERMES_WEBUI_PROJECTS_DB_SYNC`` kill switch: with the bridge
+    disabled, writes are refused too — the documented "disable the bridge
+    entirely" must mean the shared store is never touched, reads or writes.
+
     Returns ``{'id', 'slug', 'name', 'path', 'created': True}``.
     Raises ValueError with a user-facing message when the path already belongs
     to another project or the name is empty; RuntimeError when the native
@@ -366,6 +376,8 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
     init), so a fresh profile that has never run Desktop/CLI can still opt in
     to project registration.
     """
+    if not _sync_enabled():
+        raise RuntimeError("projects bridge disabled (HERMES_WEBUI_PROJECTS_DB_SYNC=0) — shared store untouched")
     name = (name or "").strip()
     if not name:
         raise ValueError("project name must not be empty")
@@ -447,6 +459,9 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
     never raises — the local workspaces.json removal has already succeeded and
     must not be rolled back by a DB-side problem.
     """
+    if not _sync_enabled():
+        # Kill switch: the shared store must stay untouched, writes included.
+        return {"archived": False, "reason": "disabled"}
     resolved = os.path.abspath(os.path.expanduser(str(path).strip())).rstrip("/\\")
     db = _projects_db_path(profile_home)
     if db is None:
@@ -535,6 +550,9 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     ``{"renamed": False, ...}`` and never raises — the local rename has
     already succeeded and must not be rolled back by a DB-side problem.
     """
+    if not _sync_enabled():
+        # Kill switch: the shared store must stay untouched, writes included.
+        return {"renamed": False, "reason": "disabled"}
     name = (name or "").strip()
     if not name:
         return {"renamed": False, "reason": "empty-name"}
