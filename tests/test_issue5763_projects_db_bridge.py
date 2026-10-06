@@ -509,7 +509,7 @@ def test_readded_workspace_at_archived_path_stays_visible(tmp_path):
     deliberately re-adds at that path under its OWN name must remain in the
     merged list (hiding every row at an archived path would make the new
     local workspace vanish with nothing to re-append it)."""
-    db = _make_projects_db(tmp_path, [
+    _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "a", "name": "Old Name", "folders": ["/srv/a"], "archived": 1},
     ])
     _cache.clear()
@@ -521,7 +521,7 @@ def test_readded_workspace_at_archived_path_stays_visible(tmp_path):
 def test_archived_mirror_same_name_still_hidden(tmp_path):
     """The mirror case (local row carries the archived project's name) must
     still be hidden — that is the row Desktop/CLI retired."""
-    db = _make_projects_db(tmp_path, [
+    _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "a", "name": "Shared Name", "folders": ["/srv/a"], "archived": 1},
     ])
     _cache.clear()
@@ -533,7 +533,7 @@ def test_kill_switch_blocks_writes(tmp_path, monkeypatch):
     """Greptile P2: HERMES_WEBUI_PROJECTS_DB_SYNC=0 must mean the shared
     store is never touched — archive/rename return a 'disabled' no-op and
     create refuses, instead of silently mutating projects.db."""
-    db = _make_projects_db(tmp_path, [
+    _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
     ])
     monkeypatch.setenv("HERMES_WEBUI_PROJECTS_DB_SYNC", "0")
