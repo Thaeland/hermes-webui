@@ -412,3 +412,84 @@ def test_archive_subprocess_fallback(tmp_path, monkeypatch):
     archived = conn.execute("SELECT archived FROM projects WHERE id='p1'").fetchone()[0]
     conn.close()
     assert archived == 1
+
+
+# ── Greptile review: failed reads, archived mirrors, WAL mtime masking ─────
+
+
+def test_failed_query_is_not_cached_and_reports_unknown(tmp_path):
+    """A transient read failure must not be cached as an authoritative empty:
+    the next poll re-queries and recovers without a timestamp change."""
+    from api.projects_bridge import load_project_state
+    db = _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    entries, archived, ok = load_project_state(profile_home=tmp_path)
+    assert ok and len(entries) == 1
+    # Corrupt the DB in place WITHOUT changing mtime: query now fails.
+    real = db.read_bytes()
+    db.write_bytes(b"not a database" * 10)
+    import os
+    os.utime(db, (db.stat().st_atime, db.stat().st_mtime))  # keep same stamp
+    entries, archived, ok = load_project_state(profile_home=tmp_path)
+    assert ok is False and entries == []
+    # Restore: same mtime, but the failure was never cached -> recovers.
+    db.write_bytes(real)
+    os.utime(db, (db.stat().st_atime, db.stat().st_mtime))
+    entries, archived, ok = load_project_state(profile_home=tmp_path)
+    assert ok is True and {(e["path"], e["name"]) for e in entries} == {("/srv/a", "A")}
+
+
+def test_merge_hides_local_mirror_of_archived_project(tmp_path):
+    """Desktop/CLI archived a project that also has a local mirror row: the
+    merge must hide the local row, not keep showing a retired project."""
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "gone", "name": "Gone", "folders": ["/srv/gone"], "archived": 1},
+        {"id": "p2", "slug": "live", "name": "Live", "folders": ["/srv/live"]},
+    ])
+    local = [
+        {"path": "/srv/gone", "name": "Gone"},   # local mirror of archived project
+        {"path": "/srv/local", "name": "Local"},  # purely local, must survive
+    ]
+    merged = merge_hermes_projects(local, profile_home=tmp_path)
+    paths = [w["path"] for w in merged]
+    assert "/srv/gone" not in paths, "archived shared project must hide its local mirror row"
+    assert "/srv/local" in paths and "/srv/live" in paths
+
+
+def test_merge_on_failed_read_is_identity(tmp_path):
+    """A failed DB read is not authoritative: local entries pass through
+    untouched (no archive-hiding, no renames)."""
+    db = tmp_path / "projects.db"
+    db.write_bytes(b"corrupt" * 20)
+    local = [{"path": "/srv/x", "name": "X"}]
+    assert merge_hermes_projects(local, profile_home=tmp_path) == local
+
+
+def test_wal_mtime_masking(tmp_path):
+    """A main DB newer than its WAL (future-dated restore, coarse timestamps)
+    must not mask a WAL commit: cache keys track the two files separately."""
+    db = _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
+    ])
+    assert len(load_hermes_project_workspaces(profile_home=tmp_path)) == 1
+    writer = sqlite3.connect(db)
+    writer.execute("PRAGMA journal_mode=WAL")
+    try:
+        writer.execute("INSERT INTO projects (id, slug, name, created_at) VALUES ('p2','b','B',1001)")
+        writer.execute("INSERT INTO project_folders VALUES ('p2','/srv/b',NULL,1,2001)")
+        writer.commit()
+        # Future-date the MAIN db so max(db,wal) would be unchanged by the WAL
+        # commit: separate tracking must still notice the WAL mtime moved.
+        import os
+        future = time.time() + 30
+        os.utime(db, (future, future))
+        load_hermes_project_workspaces(profile_home=tmp_path)  # repopulate cache
+        # Now a second WAL commit with the main DB still future-dated.
+        writer.execute("INSERT INTO projects (id, slug, name, created_at) VALUES ('p3','c','C',1002)")
+        writer.execute("INSERT INTO project_folders VALUES ('p3','/srv/c',NULL,1,2002)")
+        writer.commit()
+        entries = load_hermes_project_workspaces(profile_home=tmp_path)
+        assert {e["path"] for e in entries} == {"/srv/a", "/srv/b", "/srv/c"}
+    finally:
+        writer.close()
