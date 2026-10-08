@@ -7049,7 +7049,7 @@ def _normalize_provider_id(value: str | None) -> str:
             return normalized
     # Unknown prefix — return empty so callers treat it as "no match" and pass
     # the model through unchanged rather than incorrectly stripping it.
-    return ""
+    return "" 
 
 
 def _catalog_provider_id_sets(catalog: dict) -> tuple[set[str], set[str]]:
@@ -22954,7 +22954,7 @@ def _handle_live_models(handler, parsed):
                         custom_provider_entry = _cp
                     _config_ids.extend(_custom_provider_model_ids(_cp))
                     _allowlist_ids.extend(_custom_provider_allowlist_ids(_cp))
-
+            
             # Always try live fetch for custom providers — config entries are a
             # fallback, not a replacement.  The live endpoint should return ALL
             # models the key has access to, not just what's listed in config.yaml.
@@ -22990,7 +22990,7 @@ def _handle_live_models(handler, parsed):
                     try:
                         import urllib.request
                         import json
-
+                        
                         # Build the models endpoint URL
                         # AxonHub and similar OpenAI-compat endpoints serve /v1/models
                         _ep = _base_url.rstrip("/")
@@ -22999,15 +22999,15 @@ def _handle_live_models(handler, parsed):
                             _models_url = f"{_ep}/models"
                         else:
                             _models_url = f"{_ep}/v1/models"
-
+                        
                         _req = urllib.request.Request(
                             _models_url,
                             headers={"Authorization": f"Bearer {_api_key}"},
                         )
-
+                        
                         with urllib.request.urlopen(_req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as _resp:
                             _body = json.loads(_resp.read())
-
+                        
                         # Parse response: {"data": [{"id": "model1", ...}, ...]}
                         if isinstance(_body, dict):
                             _data = _body.get("data", [])
