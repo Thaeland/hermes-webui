@@ -28261,7 +28261,15 @@ def _handle_workspace_add(handler, body):
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
-    return j(handler, {"ok": True, "workspaces": wss})
+    # Return the merged post-mutation projection (same view as GET): the raw
+    # local list would omit DB-only neighbours and make them vanish from the
+    # picker until the next poll (re-gate finding 2 — same class as remove).
+    try:
+        from api.projects_bridge import merge_hermes_projects
+        merged = merge_hermes_projects(wss)
+    except Exception:
+        merged = wss
+    return j(handler, {"ok": True, "workspaces": merged})
 
 
 def _handle_workspace_create_project(handler, body):
@@ -28386,6 +28394,13 @@ def _handle_workspace_remove(handler, body):
     if shared_backed:
         result = archive_hermes_project(resolved_path)
         if not result.get("archived") and result.get("reason") != "not-found":
+            if result.get("reason") == "ambiguous-path":
+                return bad(
+                    handler,
+                    "This path is owned by multiple Hermes Projects (e.g. registered "
+                    "through different symlink spellings); refusing to archive an "
+                    "arbitrary one. Resolve the duplicate in Desktop/CLI first.",
+                )
             return bad(
                 handler,
                 "Could not archive the shared Hermes Project (projects writer unavailable); "
@@ -28442,6 +28457,13 @@ def _handle_workspace_rename(handler, body):
         if not result.get("renamed"):
             if result.get("reason") in ("not-found", "no-db", "disabled"):
                 return bad(handler, "Workspace not found", 404)
+            if result.get("reason") == "ambiguous-path":
+                return bad(
+                    handler,
+                    "This path is owned by multiple Hermes Projects (e.g. registered "
+                    "through different symlink spellings); refusing to rename an "
+                    "arbitrary one. Resolve the duplicate in Desktop/CLI first.",
+                )
             # DB owns the path but the writer failed (unavailable manager,
             # driver error): a 200 here would be undone by the next GET.
             return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
@@ -28470,6 +28492,13 @@ def _handle_workspace_rename(handler, body):
     if shared_backed:
         result = rename_hermes_project(resolved_path, name)
         if not result.get("renamed") and result.get("reason") != "not-found":
+            if result.get("reason") == "ambiguous-path":
+                return bad(
+                    handler,
+                    "This path is owned by multiple Hermes Projects (e.g. registered "
+                    "through different symlink spellings); refusing to rename an "
+                    "arbitrary one. Resolve the duplicate in Desktop/CLI first.",
+                )
             return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
     try:
         save_workspaces(wss, profile=active_profile)

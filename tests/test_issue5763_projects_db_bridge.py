@@ -546,3 +546,26 @@ def test_kill_switch_blocks_writes(tmp_path, monkeypatch):
     _cache.clear()
     entries, archived, ok = load_project_state(profile_home=tmp_path)
     assert ok and [(e["path"], e["name"]) for e in entries] == [("/srv/a", "A")]
+
+
+def test_reregistered_project_not_hidden_by_stale_archive(tmp_path):
+    """Re-gate MUST-FIX 1: create → remove (archives) → re-register the same
+    folder under the same name. The DB now holds BOTH the stale archived row
+    and the new active row at that path. The local mirror row matches the
+    archived name, so the archive-hiding check must NOT run while an active
+    project owns the path — otherwise the re-registered workspace vanishes
+    from the picker and reordering it never sticks."""
+    _make_projects_db(tmp_path, [
+        {"id": "p_old", "slug": "old", "name": "Shared Name", "folders": ["/srv/a"], "archived": 1},
+        {"id": "p_new", "slug": "new", "name": "Shared Name", "folders": ["/srv/a"]},
+    ])
+    _cache.clear()
+    local = [{"path": "/srv/a", "name": "Shared Name"}, {"path": "/srv/b", "name": "B"}]
+    merged = merge_hermes_projects(local, profile_home=tmp_path)
+    assert len(merged) == 2
+    # The re-registered row keeps its local position (hiding it and
+    # re-appending the DB row at the end is what made reordering never stick).
+    assert merged[0]["path"] == "/srv/a"
+    assert merged[0]["source"] == "hermes_project"
+    assert merged[0]["name"] == "Shared Name"
+    assert merged[1]["path"] == "/srv/b"

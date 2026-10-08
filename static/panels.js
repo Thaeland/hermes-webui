@@ -6413,7 +6413,7 @@ async function saveWorkspaceForm(){
     }
     renderWorkspacesPanel(_workspaceList);
     showToast(t('workspace_added'));
-    const added = _workspaceList.find(w => w.path === path) || _workspaceList[_workspaceList.length - 1];
+    const added = _workspaceList.find(w => w.path === path);
     if (added) openWorkspaceDetail(added.path);
   } catch (e) {
     errEl.textContent = t('error_prefix') + e.message;
@@ -6508,7 +6508,9 @@ async function promptWorkspacePath(){
   try{
     const data=await api('/api/workspaces/add',{method:'POST',body:JSON.stringify({path})});
     _workspaceList=data.workspaces||[];
-    const target=_workspaceList[_workspaceList.length-1];
+    // Find the added row by path: the response is the merged projection and
+    // may end with DB-only neighbours, not the row just added.
+    const target=_workspaceList.find(w=>w.path===path);
     if(!target) throw new Error(t('workspace_not_added'));
     await switchToWorkspace(target.path,target.name);
   }catch(e){
