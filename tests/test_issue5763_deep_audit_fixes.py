@@ -333,3 +333,21 @@ def test_remove_ambiguous_path_fails_closed(tmp_path, monkeypatch):
     # Both DB projects still active.
     entries, _arch, ok = load_project_state(profile_home=tmp_path)
     assert ok and len(entries) == 2
+
+
+def test_merge_dedupes_two_db_rows_for_one_directory(tmp_path):
+    """Low-severity re-gate item: two ACTIVE DB rows for one directory (e.g.
+    registered through different symlink spellings) must list ONCE in the
+    picker. Remove/rename already refuse the ambiguous case; the read side
+    must not double-render it either."""
+    real = tmp_path / "srv" / "proj"
+    real.mkdir(parents=True)
+    link = tmp_path / "srv" / "link"
+    link.symlink_to(real)
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "A", "folders": [str(real)]},
+        {"id": "p2", "slug": "b", "name": "B", "folders": [str(link)]},
+    ])
+    _cache.clear()
+    merged = merge_hermes_projects([], profile_home=tmp_path)
+    assert len(merged) == 1

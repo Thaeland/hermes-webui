@@ -395,3 +395,48 @@ def test_rename_fails_closed_when_ownership_unreadable(db_only):
         _handle_workspace_rename(handler, {"path": str(db_only), "name": "Sneaky"})
     handler.send_response.assert_called_once_with(500)
     assert not saved, "local list must be untouched when ownership is unknown"
+
+
+# ── Re-gate finding 2: /api/workspaces/add returns the merged projection ───
+
+
+def test_add_response_keeps_db_only_neighbor(db_only, tmp_path, monkeypatch):
+    """A DB-only project (no local row) must survive in the add response:
+    the picker renders this response directly, and the raw local list made
+    DB-only neighbours vanish until the next poll."""
+    from api.routes import _handle_workspace_add
+    fresh = tmp_path / "srv" / "fresh-local"
+    fresh.mkdir()
+    saved = {}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[]), \
+         patch("api.routes.save_workspaces", side_effect=lambda wss, **kw: saved.setdefault("wss", wss)):
+        _handle_workspace_add(handler, {"path": str(fresh)})
+    handler.send_response.assert_called_once_with(200)
+    resp = _response(handler)
+    paths = [w["path"] for w in resp["workspaces"]]
+    assert str(db_only) in paths, "DB-only neighbour dropped from add response"
+    assert str(fresh) in paths
+    # Only the fresh dir is persisted locally — no invented row for the DB-only one.
+    assert [w["path"] for w in saved["wss"]] == [str(fresh)]
+    # Server-normalized path for callers that typed '~/x' or a trailing slash.
+    assert resp["path"] == str(fresh)
+
+
+def test_add_rejects_duplicate_under_symlink_spelling(tmp_path, monkeypatch):
+    """path_key canonicalization: a local row at the real path must block an
+    add of the same directory through a symlinked spelling (remove/rename/
+    reorder already compare via path_key; add must too)."""
+    from api.routes import _handle_workspace_add
+    real = tmp_path / "srv" / "proj"
+    real.mkdir(parents=True)
+    link = tmp_path / "srv" / "link"
+    link.symlink_to(real)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[{"path": str(real), "name": "Proj"}]), \
+         patch("api.routes.save_workspaces", side_effect=AssertionError("must not save on duplicate")):
+        _handle_workspace_add(handler, {"path": str(link)})
+    handler.send_response.assert_called_once_with(400)
+    body = _response(handler)
+    assert "already in list" in body.get("error", "").lower()
