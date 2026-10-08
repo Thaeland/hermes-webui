@@ -424,9 +424,11 @@ def test_add_response_keeps_db_only_neighbor(db_only, tmp_path, monkeypatch):
 
 
 def test_add_rejects_duplicate_under_symlink_spelling(tmp_path, monkeypatch):
-    """path_key canonicalization: a local row at the real path must block an
-    add of the same directory through a symlinked spelling (remove/rename/
-    reorder already compare via path_key; add must too)."""
+    """path_key canonicalization: a local row stored under a symlinked
+    spelling must block an add of the same directory through the real path
+    (remove/rename/reorder already compare via path_key; add must too).
+    Note validate_workspace_to_add resolves the REQUEST path, so the
+    divergence lives on the stored-row side."""
     from api.routes import _handle_workspace_add
     real = tmp_path / "srv" / "proj"
     real.mkdir(parents=True)
@@ -434,9 +436,9 @@ def test_add_rejects_duplicate_under_symlink_spelling(tmp_path, monkeypatch):
     link.symlink_to(real)
     monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
     handler = _make_handler()
-    with patch("api.routes.load_workspaces", return_value=[{"path": str(real), "name": "Proj"}]), \
+    with patch("api.routes.load_workspaces", return_value=[{"path": str(link), "name": "Proj"}]), \
          patch("api.routes.save_workspaces", side_effect=AssertionError("must not save on duplicate")):
-        _handle_workspace_add(handler, {"path": str(link)})
+        _handle_workspace_add(handler, {"path": str(real)})
     handler.send_response.assert_called_once_with(400)
     body = _response(handler)
     assert "already in list" in body.get("error", "").lower()
