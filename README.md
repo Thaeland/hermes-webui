@@ -48,7 +48,7 @@ This gives you nearly **1:1 parity with Hermes CLI from a convenient web UI** wh
 ## Contents
 
 [<img width="750" alt="image" src="https://github.com/user-attachments/assets/7e9544a7-ba47-4fc7-8142-1d9d16b17065" />
-](https://get-hermes.ai/setup/)
+](https://get-hermes.ai/setup/) 
 
 - [Why Hermes](#why-hermes) — what it is and how it compares
 - [Quick start](#quick-start) — clone + `bootstrap.py` / `start.sh` / `ctl.sh`
@@ -99,7 +99,7 @@ What makes it different from other agentic tools:
 | Provider-agnostic | Yes | No (Claude only) | Yes | Yes | Yes |
 | Open source | Yes (MIT) | No | Yes | Yes | Yes |
 
-† Claude Code has CLAUDE.md / MEMORY.md project context and rolling auto-memory, but not full automatic cross-session recall
+† Claude Code has CLAUDE.md / MEMORY.md project context and rolling auto-memory, but not full automatic cross-session recall  
 ‡ Claude Code has cloud-managed scheduling (Anthropic infrastructure) and session-scoped `/loop`; no self-hosted cron
 
 **The closest competitor is OpenClaw** — both are always-on, self-hosted, open-source agents
