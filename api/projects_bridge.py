@@ -257,6 +257,10 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
         arch_names = archived.get(key)
         if (
             arch_names is not None
+            # An ACTIVE project at this path wins: a re-registered project
+            # (create → remove → re-add the same folder under the same name)
+            # must not be swallowed by the stale archived row it left behind.
+            and db_by_path.get(key) is None
             and (entry.get("name") or "").strip()
             and (entry.get("name") or "").strip() in arch_names
         ):
@@ -272,7 +276,11 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
             used.add(key)
         merged.append(entry)
     for e in db_entries:
-        if path_key(e["path"]) not in used:
+        key = path_key(e["path"])
+        if key not in used:
+            # Dedupe by key: two DB rows for one directory (e.g. registered
+            # through different symlink spellings) must not both appear.
+            used.add(key)
             merged.append(dict(e))
     return merged
 
