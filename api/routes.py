@@ -28254,7 +28254,13 @@ def _handle_workspace_add(handler, body):
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
-    if any(w["path"] == str(p) for w in wss):
+    # Compare via the bridge canonicalizer (realpath/expanduser/case): an exact
+    # string match let a local row under a symlinked or tilde spelling slip the
+    # duplicate check and persist a second row for the same directory
+    # (remove/rename/reorder all went through path_key; add must too).
+    from api.projects_bridge import path_key as _path_key
+    new_key = _path_key(str(p))
+    if any(_path_key(w.get("path", "")) == new_key for w in wss):
         return bad(handler, "Workspace already in list")
     wss.append({"path": str(p), "name": name or p.name})
     try:
@@ -28269,7 +28275,10 @@ def _handle_workspace_add(handler, body):
         merged = merge_hermes_projects(wss)
     except Exception:
         merged = wss
-    return j(handler, {"ok": True, "workspaces": merged})
+    # "path" is the server-normalized form: callers match the added row on it
+    # because the user may have typed '~/x' or a trailing slash, which never
+    # equals the stored row (same contract as create_project's project.path).
+    return j(handler, {"ok": True, "path": str(p), "workspaces": merged})
 
 
 def _handle_workspace_create_project(handler, body):
