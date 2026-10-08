@@ -31925,11 +31925,6 @@ def _handle_workspace_add(handler, body):
         p = validate_workspace_to_add(path_str, profile=active_profile)
     except ValueError as e:
         return bad(handler, str(e))
-    # One shared lock with the bindings save path: /api/projects/bind's
-    # _resolve_ws_list reads AND rewrites this same saved workspace list under
-    # _PROJECTS_CATALOG_LOCK, so a workspace add that read it outside the lock
-    # could have its entry dropped by a bind that read the list before the add
-    # (Greptile P1 2026-10-10T03:29:51Z: "Workspace edits get overwritten").
     with _PROJECTS_CATALOG_LOCK:
         try:
             wss = load_workspaces(profile=active_profile)
@@ -31942,8 +31937,15 @@ def _handle_workspace_add(handler, body):
             save_workspaces(wss, profile=active_profile)
         except TypeError:
             save_workspaces(wss)
-    return j(handler, {"ok": True, "workspaces": wss})
-
+        # Return the merged post-mutation projection (same view as GET): the raw
+        # local list would omit DB-only neighbours and make them vanish from the
+        # picker until the next poll (re-gate finding 2 — same class as remove).
+        try:
+            from api.projects_bridge import merge_hermes_projects
+            merged = merge_hermes_projects(wss)
+        except Exception:
+            merged = wss
+        return j(handler, {"ok": True, "workspaces": merged})
 
 def _handle_workspace_create_project(handler, body):
     """Create a Hermes Project (projects.db) AND a WebUI workspace in one step.
@@ -32032,14 +32034,14 @@ def _handle_workspace_remove(handler, body):
         return bad(handler, "path is required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
+    # Resolve once and use the same key for the local filter and the DB
+    # archive: the bridge canonicalizes (realpath/expanduser/case) while the
+    # local filter was an exact match, so a "~/x", trailing-slash, or
+    # symlinked variant could archive the shared project while leaving the
+    # local entry behind.
+    from api.projects_bridge import path_key as _path_key
+    resolved_path = _path_key(path_str)
     with _PROJECTS_CATALOG_LOCK:
-        # Resolve once and use the same key for the local filter and the DB
-        # archive: the bridge canonicalizes (realpath/expanduser/case) while the
-        # local filter was an exact match, so a "~/x", trailing-slash, or
-        # symlinked variant could archive the shared project while leaving the
-        # local entry behind.
-        from api.projects_bridge import path_key as _path_key
-        resolved_path = _path_key(path_str)
         try:
             wss = load_workspaces(profile=active_profile)
         except TypeError:
@@ -32068,6 +32070,13 @@ def _handle_workspace_remove(handler, body):
         if shared_backed:
             result = archive_hermes_project(resolved_path)
             if not result.get("archived") and result.get("reason") != "not-found":
+                if result.get("reason") == "ambiguous-path":
+                    return bad(
+                        handler,
+                        "This path is owned by multiple Hermes Projects (e.g. registered "
+                        "through different symlink spellings); refusing to archive an "
+                        "arbitrary one. Resolve the duplicate in Desktop/CLI first.",
+                    )
                 return bad(
                     handler,
                     "Could not archive the shared Hermes Project (projects writer unavailable); "
@@ -32124,6 +32133,13 @@ def _handle_workspace_rename(handler, body):
             if not result.get("renamed"):
                 if result.get("reason") in ("not-found", "no-db", "disabled"):
                     return bad(handler, "Workspace not found", 404)
+                if result.get("reason") == "ambiguous-path":
+                    return bad(
+                        handler,
+                        "This path is owned by multiple Hermes Projects (e.g. registered "
+                        "through different symlink spellings); refusing to rename an "
+                        "arbitrary one. Resolve the duplicate in Desktop/CLI first.",
+                    )
                 # DB owns the path but the writer failed (unavailable manager,
                 # driver error): a 200 here would be undone by the next GET.
                 return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
@@ -32152,6 +32168,13 @@ def _handle_workspace_rename(handler, body):
         if shared_backed:
             result = rename_hermes_project(resolved_path, name)
             if not result.get("renamed") and result.get("reason") != "not-found":
+                if result.get("reason") == "ambiguous-path":
+                    return bad(
+                        handler,
+                        "This path is owned by multiple Hermes Projects (e.g. registered "
+                        "through different symlink spellings); refusing to rename an "
+                        "arbitrary one. Resolve the duplicate in Desktop/CLI first.",
+                    )
                 return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
         try:
             save_workspaces(wss, profile=active_profile)
