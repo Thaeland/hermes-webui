@@ -351,3 +351,29 @@ def test_merge_dedupes_two_db_rows_for_one_directory(tmp_path):
     _cache.clear()
     merged = merge_hermes_projects([], profile_home=tmp_path)
     assert len(merged) == 1
+
+
+def test_merge_name_precedence_stable_with_local_row(tmp_path):
+    """Greptile P2 (re-gate round): two active projects naming one directory
+    must display the SAME name whether or not a local row exists. The append
+    loop dedupes to the first DB row, so the name override must too — before
+    the setdefault fix a reorder (which materializes a local row) flipped the
+    displayed name from the first project's to the last project's."""
+    real = tmp_path / "srv" / "proj"
+    real.mkdir(parents=True)
+    link = tmp_path / "srv" / "link"
+    link.symlink_to(real)
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "First", "folders": [str(real)]},
+        {"id": "p2", "slug": "b", "name": "Second", "folders": [str(link)]},
+    ])
+    _cache.clear()
+    without_row = merge_hermes_projects([], profile_home=tmp_path)
+    _cache.clear()
+    with_row = merge_hermes_projects(
+        [{"path": str(real), "name": "Local Stale Name"}], profile_home=tmp_path
+    )
+    assert len(without_row) == 1 and len(with_row) == 1
+    # Same displayed name in both views, and it is the FIRST project's.
+    assert without_row[0]["name"] == "First"
+    assert with_row[0]["name"] == "First"
