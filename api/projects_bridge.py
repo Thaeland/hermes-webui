@@ -247,7 +247,13 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
         return list(workspaces)
     if not db_entries and not archived:
         return list(workspaces)
-    db_by_path = {path_key(e["path"]): e for e in db_entries}
+    # First row wins for a shared path key: the append loop below dedupes to
+    # the FIRST db_entry, so the name-override side must agree — otherwise a
+    # reorder (which materializes a local row) would flip the displayed name
+    # from the first project's to the last project's without any rename.
+    db_by_path: dict[str, dict] = {}
+    for e in db_entries:
+        db_by_path.setdefault(path_key(e["path"]), e)
     merged: list[dict] = []
     used: set[str] = set()
     for w in workspaces:
