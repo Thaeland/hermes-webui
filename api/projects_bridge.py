@@ -453,9 +453,8 @@ def projects_db_openable(profile_home: Path | None = None) -> bool:
 
     Callers use this to fail *before* side effects (mkdir) when the DB exists
     but is corrupt/unopenable — a failed opt-in registration must not leave a
-    newly created empty folder behind. When the native manager is not
-    importable the subprocess fallback will surface its own errors, so this
-    returns True rather than duplicating that probe.
+    newly created empty folder behind. The probe is a plain sqlite3 read, so
+    it works whether or not the native manager is importable in this process.
 
     The probe is READ-ONLY: a missing DB returns True without opening
     anything (the native manager creates it during the real write). Opening
@@ -468,12 +467,25 @@ def projects_db_openable(profile_home: Path | None = None) -> bool:
         if db is None:
             # No DB file yet — nothing to probe; creation belongs to the write.
             return True
-        pdb = _projects_db_module()
-        if pdb is None:
-            return True
+        # Plain sqlite3 read: no native manager needed for a read-only probe,
+        # so corrupt-DB detection works even when hermes_cli is unreachable.
         conn = sqlite3.connect(db)
         try:
-            conn.execute("SELECT 1").fetchone()
+            # Probe a REAL table read, not `SELECT 1`: a valid header with a
+            # corrupt/malformed body passes SELECT 1 but fails here — the
+            # route must reject before mkdir instead of leaving an orphan
+            # folder when registration later fails (greptile P2). A valid
+            # DB without the schema yet is fine: the native manager
+            # initializes it on the real write.
+            try:
+                # SELECT * (not SELECT 1): forces SQLite to read the table
+                # b-tree pages — a header-valid DB with a malformed table
+                # page passes a constant projection (index-only) but raises
+                # here.
+                conn.execute("SELECT * FROM projects LIMIT 1").fetchone()
+            except sqlite3.OperationalError as e:
+                if "no such table" not in str(e).lower():
+                    raise
         finally:
             conn.close()
         return True

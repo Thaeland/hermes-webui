@@ -218,18 +218,19 @@ def test_mirror_provenance_survives_load_save_roundtrip(tmp_path, monkeypatch):
 @pytest.fixture()
 def remote_profile(tmp_path, monkeypatch):
     """A remote-terminal profile: terminal.cwd lives on the target host.
-    The host filesystem has alias -> real symlinks under the SAME spelling,
-    which is exactly what used to collapse two distinct remote workspaces."""
+    The HOST filesystem has alias -> real symlinks at the SAME spelling
+    UNDER the remote cwd (greptile P2: the symlink must exist at the tested
+    paths, otherwise host realpath() is identity there and the tests pass
+    even with the old host-based comparison)."""
     remote_cwd = tmp_path / "remote"
-    alias = tmp_path / "alias"
-    real = tmp_path / "real"
+    remote_cwd.mkdir()
+    real = remote_cwd / "real"
     real.mkdir()
+    alias = remote_cwd / "alias"
     alias.symlink_to(real)
     monkeypatch.setattr("api.workspace._remote_terminal_cwd",
                         lambda profile=None: str(remote_cwd))
-    return {"cwd": remote_cwd, "alias": tmp_path / "remote" / "alias",
-            "real": tmp_path / "remote" / "real",
-            "host_alias": alias, "host_real": real}
+    return {"cwd": remote_cwd, "alias": alias, "real": real}
 
 
 def test_path_key_keeps_remote_paths_unresolved(remote_profile):
@@ -237,9 +238,11 @@ def test_path_key_keeps_remote_paths_unresolved(remote_profile):
 
     alias = str(remote_profile["alias"])
     real = str(remote_profile["real"])
-    # Host realpath would fold alias -> real (host symlink exists at the
-    # same spelling); the remote-aware key must NOT.
-    assert path_key(alias) != path_key(real)
+    # No profile: host comparison deliberately folds the host symlink
+    # (realpath alias -> real) — two spellings of one HOST directory.
+    assert path_key(alias) == path_key(real)
+    # Profile-aware: remote paths are keyed as written; the host symlink
+    # must NOT collapse two distinct target-side directories.
     assert path_key(alias, profile="default") != path_key(real, profile="default")
     assert path_key(alias, profile="default") == alias.rstrip("/")
 
@@ -407,6 +410,40 @@ def test_rename_unknown_path_404_without_writer(tmp_path, monkeypatch):
          patch("api.routes.save_workspaces", side_effect=AssertionError("must not save")):
         _handle_workspace_rename(handler, {"path": "/no/such/path", "name": "X"})
     assert handler.send_response.call_args[0][0] == 404
+
+
+def test_projects_db_openable_detects_malformed_body(tmp_path):
+    """Greptile P2: `SELECT 1` validates only the file header — a DB with a
+    valid header but a corrupt table page must still fail the probe, or the
+    create route mkdirs before registration fails and leaves an orphan
+    folder. The probe reads table rows (SELECT *), which forces the b-tree
+    page read."""
+    from api.projects_bridge import projects_db_openable
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    db = home / "projects.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT)")
+    for i in range(500):
+        conn.execute("INSERT INTO projects VALUES (?, ?)", (f"r{i}", "x" * 200))
+    conn.commit()
+    conn.close()
+    raw = bytearray(db.read_bytes())
+    raw[4096] = 0x0F  # invalid page-type byte on page 2 (header stays valid)
+    db.write_bytes(bytes(raw))
+    assert projects_db_openable(profile_home=home) is False
+
+
+def test_projects_db_openable_accepts_schemaless_db(tmp_path):
+    """A valid DB without the projects schema yet is openable: the native
+    manager initializes it on the real write (probe must not over-reject)."""
+    from api.projects_bridge import projects_db_openable
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    sqlite3.connect(home / "projects.db").close()
+    assert projects_db_openable(profile_home=home) is True
 
 
 def test_projects_db_openable_does_not_create_db(tmp_path):
