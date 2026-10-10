@@ -33,6 +33,50 @@ from api.projects_bridge import (
 )
 
 
+
+def _manager_available() -> bool:
+    """A Hermes Projects manager is reachable (in-process import or agent
+    checkout for the subprocess fallback). CI's tests.yml installs pip
+    packages only — no agent checkout — so write-path tests must skip there
+    (re-gate should-fix 5)."""
+    from api.projects_bridge import _agent_dir, _projects_db_module
+    return _projects_db_module() is not None or _agent_dir() is not None
+
+
+requires_manager = pytest.mark.usefixtures("_requires_manager")
+
+
+@pytest.fixture
+def _requires_manager():
+    if not _manager_available():
+        pytest.skip("no Hermes Projects manager reachable (agent checkout absent)")
+
+
+@pytest.fixture(autouse=True)
+def _preimport_lazy_state_wal():
+    """Upstream ``open_db`` imports ``hermes_state_wal`` lazily at connect()
+    time; conftest's per-test sys.path restore can drop the agent dir
+    between tests, so the lazy import fails mid-suite (passes alone, fails
+    in a multi-file run). Pre-import it here — adding the agent dir to
+    sys.path ourselves when a prior test stripped it — so the module cache
+    answers the lazy import (re-gate should-fix 5). conftest restores
+    sys.path after the test, so the append does not leak."""
+    import sys
+    try:
+        import api.config  # noqa: F401  (normally appends the agent dir)
+        from api.projects_bridge import _agent_dir
+        d = _agent_dir()
+        # A prior test's sys.path restore can strip the agent dir entirely —
+        # re-add it for THIS test (conftest restores sys.path afterwards, so
+        # the append never leaks) so hermes_cli AND its lazy hermes_state_wal
+        # import both keep resolving mid-suite.
+        if d is not None and str(d) not in sys.path:
+            sys.path.append(str(d))
+        import hermes_state_wal  # noqa: F401
+    except Exception:
+        pass
+    yield
+
 @pytest.fixture(autouse=True)
 def _clear_bridge_cache():
     _cache.clear()
@@ -114,6 +158,7 @@ def test_merge_no_double_listing_for_symlinked_db_path(tmp_path):
     assert merged[0]["name"] == "Proj"
 
 
+@requires_manager
 def test_archive_finds_project_under_symlinked_db_path(tmp_path):
     """archive_hermes_project(resolved real path) must find the DB row stored
     under a symlinked spelling — otherwise the route's shared-backed remove
@@ -130,6 +175,7 @@ def test_archive_finds_project_under_symlinked_db_path(tmp_path):
     assert load_project_state(profile_home=tmp_path)[0] == []
 
 
+@requires_manager
 def test_remove_shared_backed_via_symlink_no_silent_revert(tmp_path, monkeypatch):
     """Route-level: local row under the real path, DB row under a symlinked
     path. Remove must archive the shared project (not take the local-only
@@ -195,7 +241,8 @@ def test_multiple_archived_names_at_one_path_all_hidden(tmp_path):
         {"id": "p1", "slug": "a", "name": "X", "folders": ["/srv/p"], "archived": 1},
         {"id": "p2", "slug": "b", "name": "Y", "folders": ["/srv/p"], "archived": 1},
     ])
-    merged = merge_hermes_projects([{"path": "/srv/p", "name": "Y"}], profile_home=tmp_path)
+    merged = merge_hermes_projects(
+        [{"path": "/srv/p", "name": "Y", "project_mirror": True}], profile_home=tmp_path)
     assert merged == []
 
 
@@ -257,6 +304,7 @@ def test_register_as_project_checkbox_unchecked_by_default():
 # ── greptile P1: distinct projects sharing one canonical path ───────────────
 
 
+@requires_manager
 def test_archive_refuses_ambiguous_path(tmp_path):
     """Two DB projects whose primary paths canonicalize to the same directory
     (real path + symlink spelling) collapse to one picker entry. Archive must
@@ -279,6 +327,7 @@ def test_archive_refuses_ambiguous_path(tmp_path):
     assert ok and len(entries) == 2
 
 
+@requires_manager
 def test_rename_refuses_ambiguous_path(tmp_path):
     real = tmp_path / "srv" / "proj"
     real.mkdir(parents=True)
@@ -295,6 +344,7 @@ def test_rename_refuses_ambiguous_path(tmp_path):
     assert ok and {e["name"] for e in entries} == {"Proj A", "Proj B"}
 
 
+@requires_manager
 def test_archive_single_match_still_works_after_ambiguity_check(tmp_path):
     """Guard against the ambiguity check over-refusing: one project, one
     spelling — archive still succeeds."""

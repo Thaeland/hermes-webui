@@ -51,7 +51,47 @@ def _sync_enabled() -> bool:
     return os.environ.get(_DISABLE_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
 
 
-def path_key(path: str | Path) -> str:
+def sync_enabled() -> bool:
+    """Public kill-switch probe: True when the shared store may be read/written.
+
+    Route handlers call this BEFORE any preflight that could touch the DB
+    (open/initialize) or the filesystem (mkdir), so `HERMES_WEBUI_PROJECTS_DB_SYNC=0`
+    means the shared store is genuinely never touched (re-gate should-fix 4).
+    """
+    return _sync_enabled()
+
+
+def _is_remote_workspace_path(path: str, profile: str | Path | None = None) -> bool:
+    """True when ``path`` is a target-side remote terminal path (SSH/Docker).
+
+    Remote paths live on the target host: resolving them against the WebUI
+    host filesystem (``realpath``) is wrong — a host symlink with the same
+    spelling silently collapses a remote workspace onto a local directory
+    (re-gate must-fix 2). Detection reuses the same profile-aware candidate
+    check the workspace validators use, so the answer is consistent with
+    how the row was stored in the first place.
+    """
+    try:
+        from api.workspace import _remote_terminal_workspace_candidate
+        return _remote_terminal_workspace_candidate(path, profile=profile) is not None
+    except Exception:
+        return False
+
+
+def is_remote_workspace_path(path: str, profile: str | Path | None = None) -> bool:
+    """Public probe: True when ``path`` is a target-side remote workspace for
+    ``profile``. Route handlers use this to keep remote paths out of ALL
+    projects.db logic — the shared store is host-local, and a remote path
+    whose spelling coincides with a host directory must never be treated as
+    host-owned (re-gate must-fix 2)."""
+    return profile is not None and _is_remote_workspace_path(str(path), profile=profile)
+
+
+def _lexical_key(s: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(s))).rstrip("/\\")
+
+
+def path_key(path: str | Path, profile: str | Path | None = None) -> str:
     """Canonical comparison key for a workspace/project path.
 
     Both sides of every bridge comparison go through this. Local
@@ -65,13 +105,26 @@ def path_key(path: str | Path) -> str:
     ``realpath`` folds symlinks (and, on case-insensitive filesystems, the
     on-disk casing); ``normcase`` covers Windows case-folding. Trailing
     separators are stripped so ``/x`` and ``/x/`` compare equal.
+
+    ``profile`` makes the key profile-aware: paths that are target-side
+    remote terminal workspaces for that profile are keyed lexically (no
+    host ``realpath``), so a host symlink cannot collapse a remote path
+    onto a local directory (re-gate must-fix 2). DB paths are always
+    host-local and keep the symlink-folding key regardless.
     """
     s = str(path).strip()
+    if profile is not None and _is_remote_workspace_path(s, profile=profile):
+        # Remote target-side path: keep it as written (lexical normalization
+        # only — abspath never touches the filesystem).
+        try:
+            return _lexical_key(s)
+        except (OSError, ValueError):
+            return os.path.normcase(s).rstrip("/\\")
     try:
         return os.path.normcase(os.path.realpath(os.path.expanduser(s))).rstrip("/\\")
     except (OSError, ValueError):
         # Embedded NUL or pathological input: fall back to the lexical form.
-        return os.path.normcase(os.path.abspath(os.path.expanduser(s))).rstrip("/\\")
+        return _lexical_key(s)
 
 
 def _projects_db_path(profile_home: Path | None) -> Path | None:
@@ -225,17 +278,19 @@ def load_hermes_project_workspaces(profile_home: Path | None = None) -> list[dic
     return entries if ok else []
 
 
-def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = None) -> list[dict]:
+def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = None, profile: str | Path | None = None) -> list[dict]:
     """Merge projects.db entries into a WebUI workspace list.
 
     - projects.db is authoritative for a path it owns: a local entry with the
       same path takes the project's display name.
-    - A local MIRROR row whose shared project was ARCHIVED (from Desktop/CLI)
-      is hidden — but only when it is actually the mirror: same name as the
-      archived project. A workspace the user deliberately re-added at that
-      path under its own name after the archive must stay visible (there is
-      no active DB entry to re-append it, so hiding it would make the new
-      workspace vanish).
+    - A local row explicitly marked as a project MIRROR (``project_mirror``
+      provenance, persisted in workspaces.json when the row was created from
+      a projects.db registration) whose shared project was ARCHIVED
+      (from Desktop/CLI) is hidden. Provenance is the ONLY hiding trigger:
+      a plain local workspace re-added at an archived project's path — even
+      under the same name — must stay visible (re-gate must-fix 1: name-based
+      inference made a legitimate re-add an invisible row that the add route
+      then refused as a duplicate).
     - Local-only entries keep their order and names (WebUI additions still work).
     - DB projects not present locally are appended.
     - A FAILED DB read is not authoritative: local entries pass through
@@ -259,21 +314,11 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     for w in workspaces:
         entry = dict(w)
         path = entry.get("path", "")
-        key = path_key(path)
-        arch_names = archived.get(key)
-        if (
-            arch_names is not None
-            # An ACTIVE project at this path wins: a re-registered project
-            # (create → remove → re-add the same folder under the same name)
-            # must not be swallowed by the stale archived row it left behind.
-            and db_by_path.get(key) is None
-            and (entry.get("name") or "").strip()
-            and (entry.get("name") or "").strip() in arch_names
-        ):
-            # Local mirror of a retired shared project: hide it. A local row
-            # with a DIFFERENT (or empty) name is a deliberate re-add, not a
-            # mirror — and a blank name must never match an archived project
-            # that itself has no name (deep-audit P3 empty-name asymmetry).
+        key = path_key(path, profile=profile)
+        if entry.get("project_mirror") and archived.get(key) is not None and db_by_path.get(key) is None:
+            # Persisted mirror of a retired shared project: hide it. Rows
+            # without the provenance flag are ordinary local workspaces and
+            # always survive an archived-name match at their path.
             continue
         hit = db_by_path.get(key)
         if hit is not None:
@@ -410,16 +455,25 @@ def projects_db_openable(profile_home: Path | None = None) -> bool:
     newly created empty folder behind. When the native manager is not
     importable the subprocess fallback will surface its own errors, so this
     returns True rather than duplicating that probe.
+
+    The probe is READ-ONLY: a missing DB returns True without opening
+    anything (the native manager creates it during the real write). Opening
+    with the initializing connection here would create + schema-init
+    ``projects.db`` even when a later validation rejects the path (re-gate
+    low: preflight must not write).
     """
     try:
         db = _projects_db_path(profile_home)
         if db is None:
-            db = _profile_home_for_write(profile_home) / "projects.db"
+            # No DB file yet — nothing to probe; creation belongs to the write.
+            return True
         pdb = _projects_db_module()
         if pdb is None:
             return True
-        conn = pdb.connect(db_path=db)
-        with contextlib.suppress(Exception):
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("SELECT 1").fetchone()
+        finally:
             conn.close()
         return True
     except Exception:
@@ -507,6 +561,10 @@ try:
     from pathlib import Path
     conn = pdb.connect(db_path=Path(db_path))
     try:
+        # BEGIN IMMEDIATE spans lookup + ambiguity check + mutation so a
+        # concurrent writer cannot swap the owner between our read and write
+        # (re-gate must-fix 3; mirrors the in-process implementation).
+        conn.execute("BEGIN IMMEDIATE")
         key = _key(path)
         matches = []
         for p_ in pdb.list_projects(conn, include_archived=False):
@@ -515,12 +573,14 @@ try:
             if primary and _key(primary) == key:
                 matches.append(p_)
         if not matches:
+            conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "archived": False, "reason": "not-found"}))
         elif len(matches) > 1:
+            conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "archived": False, "reason": "ambiguous-path", "count": len(matches)}))
         else:
-            ok = pdb.archive_project(conn, matches[0].id)
-            conn.commit()
+            ok = conn.execute("UPDATE projects SET archived = 1 WHERE id = ?", (matches[0].id,)).rowcount
+            conn.execute("COMMIT")
             print(json.dumps({"ok": True, "archived": bool(ok), "id": matches[0].id}))
     finally:
         conn.close()
@@ -556,7 +616,7 @@ def _find_projects_by_path(pdb, conn, path: str):
     return matches
 
 
-def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
+def archive_hermes_project(path: str, profile_home: Path | None = None, profile: str | Path | None = None) -> dict:
     """Archive the projects.db project owning ``path`` (if any).
 
     Fail-safe by contract, mirroring the read bridge: any error (no DB, no
@@ -567,6 +627,11 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
     if not _sync_enabled():
         # Kill switch: the shared store must stay untouched, writes included.
         return {"archived": False, "reason": "disabled"}
+    if profile is not None and _is_remote_workspace_path(str(path), profile=profile):
+        # Remote target-side path: projects.db is host-local — archiving by
+        # its host realpath spelling could hit an unrelated host project
+        # (re-gate must-fix 2). Nothing to archive.
+        return {"archived": False, "reason": "remote-path"}
     resolved = path_key(path)
     db = _projects_db_path(profile_home)
     if db is None:
@@ -576,24 +641,32 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
         try:
             conn = pdb.connect(db_path=db)
             try:
-                matches = _find_projects_by_path(pdb, conn, resolved)
-                if not matches:
-                    return {"archived": False, "reason": "not-found"}
-                if len(matches) > 1:
-                    # Ambiguous owner: the picker shows one collapsed entry for
-                    # this path, but the DB has several projects behind it.
-                    # Refuse rather than archive a project the user did not
-                    # target (greptile P1).
-                    return {"archived": False, "reason": "ambiguous-path",
-                            "count": len(matches)}
-                proj = matches[0]
-                ok = pdb.archive_project(conn, proj.id)
-                conn.commit()
+                # One BEGIN IMMEDIATE spans owner lookup, ambiguity check and
+                # the mutation (re-gate must-fix 3): a concurrent native
+                # connection cannot move the matched project's folder and
+                # register a replacement at this path between our read and
+                # our write. The UPDATE is inlined (same statement as
+                # pdb.archive_project) because write_txn cannot nest.
+                with pdb.write_txn(conn):
+                    matches = _find_projects_by_path(pdb, conn, resolved)
+                    if not matches:
+                        return {"archived": False, "reason": "not-found"}
+                    if len(matches) > 1:
+                        # Ambiguous owner: the picker shows one collapsed entry
+                        # for this path, but the DB has several projects behind
+                        # it. Refuse rather than archive a project the user did
+                        # not target (greptile P1).
+                        return {"archived": False, "reason": "ambiguous-path",
+                                "count": len(matches)}
+                    proj = matches[0]
+                    n = conn.execute(
+                        "UPDATE projects SET archived = 1 WHERE id = ?", (proj.id,)
+                    ).rowcount
+                _invalidate_cache(db)
+                return {"archived": bool(n), "id": proj.id}
             finally:
                 with contextlib.suppress(Exception):
                     conn.close()
-            _invalidate_cache(db)
-            return {"archived": bool(ok), "id": proj.id}
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("archive_hermes_project failed: %s", e)
             return {"archived": False, "reason": "error"}
@@ -647,6 +720,9 @@ try:
     from pathlib import Path
     conn = pdb.connect(db_path=Path(db_path))
     try:
+        # BEGIN IMMEDIATE spans lookup + ambiguity check + mutation
+        # (re-gate must-fix 3; mirrors the in-process implementation).
+        conn.execute("BEGIN IMMEDIATE")
         key = _key(path)
         matches = []
         for p_ in pdb.list_projects(conn, include_archived=False):
@@ -655,12 +731,14 @@ try:
             if primary and _key(primary) == key:
                 matches.append(p_)
         if not matches:
+            conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "renamed": False, "reason": "not-found"}))
         elif len(matches) > 1:
+            conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "renamed": False, "reason": "ambiguous-path", "count": len(matches)}))
         else:
-            ok = pdb.update_project(conn, matches[0].id, name=name)
-            conn.commit()
+            ok = conn.execute("UPDATE projects SET name = ? WHERE id = ?", (name, matches[0].id)).rowcount
+            conn.execute("COMMIT")
             print(json.dumps({"ok": True, "renamed": bool(ok), "id": matches[0].id}))
     finally:
         conn.close()
@@ -669,7 +747,7 @@ except Exception as e:
 """
 
 
-def rename_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
+def rename_hermes_project(path: str, name: str, profile_home: Path | None = None, profile: str | Path | None = None) -> dict:
     """Rename the projects.db project owning ``path`` (if any).
 
     Fail-safe by contract, mirroring archive: any error yields
@@ -682,6 +760,9 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     name = (name or "").strip()
     if not name:
         return {"renamed": False, "reason": "empty-name"}
+    if profile is not None and _is_remote_workspace_path(str(path), profile=profile):
+        # Remote target-side path — see archive_hermes_project.
+        return {"renamed": False, "reason": "remote-path"}
     resolved = path_key(path)
     db = _projects_db_path(profile_home)
     if db is None:
@@ -691,21 +772,26 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
         try:
             conn = pdb.connect(db_path=db)
             try:
-                matches = _find_projects_by_path(pdb, conn, resolved)
-                if not matches:
-                    return {"renamed": False, "reason": "not-found"}
-                if len(matches) > 1:
-                    # Ambiguous owner — see archive_hermes_project.
-                    return {"renamed": False, "reason": "ambiguous-path",
-                            "count": len(matches)}
-                proj = matches[0]
-                ok = pdb.update_project(conn, proj.id, name=name)
-                conn.commit()
+                # Transactional lookup+mutation — see archive_hermes_project
+                # (re-gate must-fix 3). The UPDATE mirrors pdb.update_project's
+                # name branch because write_txn cannot nest.
+                with pdb.write_txn(conn):
+                    matches = _find_projects_by_path(pdb, conn, resolved)
+                    if not matches:
+                        return {"renamed": False, "reason": "not-found"}
+                    if len(matches) > 1:
+                        # Ambiguous owner — see archive_hermes_project.
+                        return {"renamed": False, "reason": "ambiguous-path",
+                                "count": len(matches)}
+                    proj = matches[0]
+                    n = conn.execute(
+                        "UPDATE projects SET name = ? WHERE id = ?", (name, proj.id)
+                    ).rowcount
+                _invalidate_cache(db)
+                return {"renamed": bool(n), "id": proj.id}
             finally:
                 with contextlib.suppress(Exception):
                     conn.close()
-            _invalidate_cache(db)
-            return {"renamed": bool(ok), "id": proj.id}
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("rename_hermes_project failed: %s", e)
             return {"renamed": False, "reason": "error"}

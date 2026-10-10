@@ -502,7 +502,16 @@ def _clean_workspace_list(workspaces: list, profile: str | Path | None = None) -
         # Rename confusing 'default' label to 'Home'
         if name.lower() == 'default':
             name = 'Home'
-        result.append({'path': str(p), 'name': name})
+        # Preserve mirror provenance (#5763): rows created from a
+        # projects.db registration carry project_mirror=True so the merge
+        # can hide exactly the rows whose shared project was archived —
+        # without that flag a plain local re-add at an archived project's
+        # path would be hidden and then refused as a duplicate (re-gate
+        # must-fix 1). Any other extra keys are still dropped on purpose.
+        entry = {'path': str(p), 'name': name}
+        if w.get('project_mirror'):
+            entry['project_mirror'] = True
+        result.append(entry)
     return result
 
 
