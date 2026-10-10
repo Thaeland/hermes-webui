@@ -78,15 +78,6 @@ def _is_remote_workspace_path(path: str, profile: str | Path | None = None) -> b
         return False
 
 
-def is_remote_workspace_path(path: str, profile: str | Path | None = None) -> bool:
-    """Public probe: True when ``path`` is a target-side remote workspace for
-    ``profile``. Route handlers use this to keep remote paths out of ALL
-    projects.db logic — the shared store is host-local, and a remote path
-    whose spelling coincides with a host directory must never be treated as
-    host-owned (re-gate must-fix 2)."""
-    return profile is not None and _is_remote_workspace_path(str(path), profile=profile)
-
-
 def _lexical_key(s: str) -> str:
     return os.path.normcase(os.path.abspath(os.path.expanduser(s))).rstrip("/\\")
 
@@ -295,6 +286,8 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     - DB projects not present locally are appended.
     - A FAILED DB read is not authoritative: local entries pass through
       untouched (no archive-hiding, no renames).
+    ``profile`` is accepted for call-site symmetry; every row<->DB comparison
+    here keys the host form (the DB is host-local) regardless of profile.
     Never mutates the input list.
     """
     db_entries, archived, read_ok = load_project_state(profile_home=profile_home)
@@ -314,7 +307,15 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     for w in workspaces:
         entry = dict(w)
         path = entry.get("path", "")
-        key = path_key(path, profile=profile)
+        # Row<->DB comparisons key the HOST form on BOTH sides: projects.db is
+        # a host-local store, so a local row — even one spelled under a remote
+        # profile's terminal.cwd — matches a DB project by its host-resolved
+        # path. Keying the row lexically while DB entries keyed via realpath
+        # showed two picker rows for one directory when a host symlink
+        # collapsed a DB path under the remote cwd (deep-audit 2a). Row<->row
+        # dedupe elsewhere stays profile-aware so remote spellings never
+        # collapse (must-fix 2).
+        key = path_key(path)
         if entry.get("project_mirror") and archived.get(key) is not None and db_by_path.get(key) is None:
             # Persisted mirror of a retired shared project: hide it. Rows
             # without the provenance flag are ordinary local workspaces and
@@ -616,7 +617,7 @@ def _find_projects_by_path(pdb, conn, path: str):
     return matches
 
 
-def archive_hermes_project(path: str, profile_home: Path | None = None, profile: str | Path | None = None) -> dict:
+def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
     """Archive the projects.db project owning ``path`` (if any).
 
     Fail-safe by contract, mirroring the read bridge: any error (no DB, no
@@ -627,11 +628,6 @@ def archive_hermes_project(path: str, profile_home: Path | None = None, profile:
     if not _sync_enabled():
         # Kill switch: the shared store must stay untouched, writes included.
         return {"archived": False, "reason": "disabled"}
-    if profile is not None and _is_remote_workspace_path(str(path), profile=profile):
-        # Remote target-side path: projects.db is host-local — archiving by
-        # its host realpath spelling could hit an unrelated host project
-        # (re-gate must-fix 2). Nothing to archive.
-        return {"archived": False, "reason": "remote-path"}
     resolved = path_key(path)
     db = _projects_db_path(profile_home)
     if db is None:
@@ -747,7 +743,7 @@ except Exception as e:
 """
 
 
-def rename_hermes_project(path: str, name: str, profile_home: Path | None = None, profile: str | Path | None = None) -> dict:
+def rename_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
     """Rename the projects.db project owning ``path`` (if any).
 
     Fail-safe by contract, mirroring archive: any error yields
@@ -760,9 +756,6 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     name = (name or "").strip()
     if not name:
         return {"renamed": False, "reason": "empty-name"}
-    if profile is not None and _is_remote_workspace_path(str(path), profile=profile):
-        # Remote target-side path — see archive_hermes_project.
-        return {"renamed": False, "reason": "remote-path"}
     resolved = path_key(path)
     db = _projects_db_path(profile_home)
     if db is None:
