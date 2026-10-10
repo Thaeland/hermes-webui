@@ -58,6 +58,50 @@ def _make_projects_db(home: Path, projects: list[dict]) -> Path:
     return db
 
 
+
+def _manager_available() -> bool:
+    """A Hermes Projects manager is reachable (in-process import or agent
+    checkout for the subprocess fallback). CI's tests.yml installs pip
+    packages only — no agent checkout — so write-path tests must skip there
+    (re-gate should-fix 5)."""
+    from api.projects_bridge import _agent_dir, _projects_db_module
+    return _projects_db_module() is not None or _agent_dir() is not None
+
+
+requires_manager = pytest.mark.usefixtures("_requires_manager")
+
+
+@pytest.fixture
+def _requires_manager():
+    if not _manager_available():
+        pytest.skip("no Hermes Projects manager reachable (agent checkout absent)")
+
+
+@pytest.fixture(autouse=True)
+def _preimport_lazy_state_wal():
+    """Upstream ``open_db`` imports ``hermes_state_wal`` lazily at connect()
+    time; conftest's per-test sys.path restore can drop the agent dir
+    between tests, so the lazy import fails mid-suite (passes alone, fails
+    in a multi-file run). Pre-import it here — adding the agent dir to
+    sys.path ourselves when a prior test stripped it — so the module cache
+    answers the lazy import (re-gate should-fix 5). conftest restores
+    sys.path after the test, so the append does not leak."""
+    import sys
+    try:
+        import api.config  # noqa: F401  (normally appends the agent dir)
+        from api.projects_bridge import _agent_dir
+        d = _agent_dir()
+        # A prior test's sys.path restore can strip the agent dir entirely —
+        # re-add it for THIS test (conftest restores sys.path afterwards, so
+        # the append never leaks) so hermes_cli AND its lazy hermes_state_wal
+        # import both keep resolving mid-suite.
+        if d is not None and str(d) not in sys.path:
+            sys.path.append(str(d))
+        import hermes_state_wal  # noqa: F401
+    except Exception:
+        pass
+    yield
+
 @pytest.fixture(autouse=True)
 def _clear_bridge_cache():
     _cache.clear()
@@ -192,6 +236,7 @@ def test_env_kill_switch(tmp_path, monkeypatch):
 from api.projects_bridge import create_hermes_project
 
 
+@requires_manager
 def test_create_project_writes_db_and_visible_on_read(tmp_path):
     _make_projects_db(tmp_path, [])
     # Populate the read cache BEFORE create, so the assertion below actually
@@ -207,6 +252,7 @@ def test_create_project_writes_db_and_visible_on_read(tmp_path):
     assert ("/srv/newproj", "New Project") in {(e["path"], e["name"]) for e in entries}
 
 
+@requires_manager
 def test_create_project_slug_and_primary(tmp_path):
     db = _make_projects_db(tmp_path, [])
     create_hermes_project("/srv/My Cool App/", "My Cool App", profile_home=tmp_path)
@@ -222,6 +268,7 @@ def test_create_project_slug_and_primary(tmp_path):
     conn.close()
 
 
+@requires_manager
 def test_create_project_duplicate_slug_gets_suffix(tmp_path):
     db = _make_projects_db(tmp_path, [])
     create_hermes_project("/srv/a", "Dup Name", profile_home=tmp_path)
@@ -232,6 +279,7 @@ def test_create_project_duplicate_slug_gets_suffix(tmp_path):
     assert slugs == ["dup-name", "dup-name-2"]
 
 
+@requires_manager
 def test_create_project_duplicate_path_raises(tmp_path):
     _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "existing", "name": "Existing", "folders": ["/srv/x"]},
@@ -246,6 +294,7 @@ def test_create_project_empty_name_raises(tmp_path):
         create_hermes_project("/srv/x", "  ", profile_home=tmp_path)
 
 
+@requires_manager
 def test_create_project_initializes_missing_db(tmp_path):
     # Fresh profile (no projects.db): the native manager initializes the DB +
     # schema on connect, so registration must succeed rather than reject.
@@ -320,6 +369,7 @@ def test_create_project_subprocess_no_agent_dir(tmp_path, monkeypatch):
 from api.projects_bridge import archive_hermes_project
 
 
+@requires_manager
 def test_archive_hides_project_from_listing(tmp_path):
     _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "gufo", "name": "Gufo", "folders": ["/srv/gufo"]},
@@ -332,6 +382,7 @@ def test_archive_hides_project_from_listing(tmp_path):
     assert [e["path"] for e in entries] == ["/srv/omp"]
 
 
+@requires_manager
 def test_archive_is_idempotent(tmp_path):
     _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "a", "name": "A", "folders": ["/srv/a"]},
@@ -372,6 +423,7 @@ def test_query_handles_hash_in_db_path(tmp_path):
 from api.projects_bridge import rename_hermes_project
 
 
+@requires_manager
 def test_rename_updates_db_name(tmp_path):
     _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "a", "name": "Old", "folders": ["/srv/a"]},
@@ -453,7 +505,10 @@ def test_merge_hides_local_mirror_of_archived_project(tmp_path):
         {"id": "p2", "slug": "live", "name": "Live", "folders": ["/srv/live"]},
     ])
     local = [
-        {"path": "/srv/gone", "name": "Gone"},   # local mirror of archived project
+        # local mirror of archived project — carries the persisted mirror
+        # provenance stamped at creation (re-gate must-fix 1: provenance,
+        # not name-matching, is the hiding trigger)
+        {"path": "/srv/gone", "name": "Gone", "project_mirror": True},
         {"path": "/srv/local", "name": "Local"},  # purely local, must survive
     ]
     merged = merge_hermes_projects(local, profile_home=tmp_path)
@@ -525,7 +580,8 @@ def test_archived_mirror_same_name_still_hidden(tmp_path):
         {"id": "p1", "slug": "a", "name": "Shared Name", "folders": ["/srv/a"], "archived": 1},
     ])
     _cache.clear()
-    merged = merge_hermes_projects([{"path": "/srv/a", "name": "Shared Name"}], profile_home=tmp_path)
+    merged = merge_hermes_projects(
+        [{"path": "/srv/a", "name": "Shared Name", "project_mirror": True}], profile_home=tmp_path)
     assert merged == []
 
 

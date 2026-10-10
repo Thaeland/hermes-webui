@@ -59,6 +59,50 @@ def _response(handler):
     return json.loads(body)
 
 
+
+def _manager_available() -> bool:
+    """A Hermes Projects manager is reachable (in-process import or agent
+    checkout for the subprocess fallback). CI's tests.yml installs pip
+    packages only — no agent checkout — so write-path tests must skip there
+    (re-gate should-fix 5)."""
+    from api.projects_bridge import _agent_dir, _projects_db_module
+    return _projects_db_module() is not None or _agent_dir() is not None
+
+
+requires_manager = pytest.mark.usefixtures("_requires_manager")
+
+
+@pytest.fixture
+def _requires_manager():
+    if not _manager_available():
+        pytest.skip("no Hermes Projects manager reachable (agent checkout absent)")
+
+
+@pytest.fixture(autouse=True)
+def _preimport_lazy_state_wal():
+    """Upstream ``open_db`` imports ``hermes_state_wal`` lazily at connect()
+    time; conftest's per-test sys.path restore can drop the agent dir
+    between tests, so the lazy import fails mid-suite (passes alone, fails
+    in a multi-file run). Pre-import it here — adding the agent dir to
+    sys.path ourselves when a prior test stripped it — so the module cache
+    answers the lazy import (re-gate should-fix 5). conftest restores
+    sys.path after the test, so the append does not leak."""
+    import sys
+    try:
+        import api.config  # noqa: F401  (normally appends the agent dir)
+        from api.projects_bridge import _agent_dir
+        d = _agent_dir()
+        # A prior test's sys.path restore can strip the agent dir entirely —
+        # re-add it for THIS test (conftest restores sys.path afterwards, so
+        # the append never leaks) so hermes_cli AND its lazy hermes_state_wal
+        # import both keep resolving mid-suite.
+        if d is not None and str(d) not in sys.path:
+            sys.path.append(str(d))
+        import hermes_state_wal  # noqa: F401
+    except Exception:
+        pass
+    yield
+
 @pytest.fixture(autouse=True)
 def _clear_bridge_cache():
     _cache.clear()
@@ -121,6 +165,7 @@ def test_trust_rejects_archived_project(tmp_path, monkeypatch):
 # ── Fix 4: rename works on DB-only entries ─────────────────────────────────
 
 
+@requires_manager
 def test_rename_db_only_project_succeeds(db_only):
     from api.routes import _handle_workspace_rename
     handler = _make_handler()
@@ -155,6 +200,7 @@ def test_rename_unknown_path_still_404(tmp_path, monkeypatch):
 # ── Fix 1: fresh-profile create_project route (no pre-existing projects.db) ─
 
 
+@requires_manager
 def test_create_project_route_fresh_profile_succeeds(tmp_path, monkeypatch):
     # Reviewer blocker: default New Workspace flow on a profile that has never
     # run Desktop/CLI. With the box checked and NO projects.db, the native
@@ -238,6 +284,7 @@ def test_reorder_omitting_db_only_entry_still_returns_it(db_only):
 # ── Re-gate finding 1: remove must return the merged post-mutation view ────
 
 
+@requires_manager
 def test_remove_db_only_keeps_surviving_neighbor_in_response(tmp_path, monkeypatch):
     from api.routes import _handle_workspace_remove
     a = tmp_path / "srv" / "proj-a"

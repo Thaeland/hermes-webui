@@ -15187,7 +15187,7 @@ def handle_get(handler, parsed) -> bool:
         # local workspaces.json list unchanged.
         try:
             from api.projects_bridge import merge_hermes_projects
-            wss = merge_hermes_projects(wss)
+            wss = merge_hermes_projects(wss, profile=active_profile)
         except Exception:
             logger.debug("projects.db workspace merge skipped", exc_info=True)
         try:
@@ -28258,10 +28258,23 @@ def _handle_workspace_add(handler, body):
     # string match let a local row under a symlinked or tilde spelling slip the
     # duplicate check and persist a second row for the same directory
     # (remove/rename/reorder all went through path_key; add must too).
-    from api.projects_bridge import path_key as _path_key
-    new_key = _path_key(str(p))
-    if any(_path_key(w.get("path", "")) == new_key for w in wss):
+    # The check runs against the MERGED (picker-visible) view: a hidden mirror
+    # row whose shared project was archived must NOT block a plain re-add —
+    # the user sees no row, so "already in list" was a dead end (re-gate
+    # must-fix 1). If the merge fails, merged == wss and this degrades to the
+    # old strict local check (fail-closed on duplicates).
+    from api.projects_bridge import merge_hermes_projects, path_key as _path_key
+    try:
+        merged_now = merge_hermes_projects(wss, profile=active_profile)
+    except Exception:
+        merged_now = wss
+    new_key = _path_key(str(p), profile=active_profile)
+    if any(_path_key(w.get("path", ""), profile=active_profile) == new_key for w in merged_now):
         return bad(handler, "Workspace already in list")
+    # Any local row at this key that the merge hides (retired mirror) is
+    # replaced by the new plain row — never keep a hidden row plus a visible
+    # one for the same directory.
+    wss = [w for w in wss if _path_key(w.get("path", ""), profile=active_profile) != new_key]
     wss.append({"path": str(p), "name": name or p.name})
     try:
         save_workspaces(wss, profile=active_profile)
@@ -28271,8 +28284,7 @@ def _handle_workspace_add(handler, body):
     # local list would omit DB-only neighbours and make them vanish from the
     # picker until the next poll (re-gate finding 2 — same class as remove).
     try:
-        from api.projects_bridge import merge_hermes_projects
-        merged = merge_hermes_projects(wss)
+        merged = merge_hermes_projects(wss, profile=active_profile)
     except Exception:
         merged = wss
     # "path" is the server-normalized form: callers match the added row on it
@@ -28312,7 +28324,12 @@ def _handle_workspace_create_project(handler, body):
     # manager is unreachable — a fresh profile with no projects.db is fine (the
     # native manager initializes it), but no-manager installs must not be left
     # with an orphan directory and a half-saved workspace.
-    from api.projects_bridge import projects_db_openable, projects_write_supported
+    from api.projects_bridge import projects_db_openable, projects_write_supported, sync_enabled
+    if not sync_enabled():
+        # Kill switch means the shared store is NEVER touched: reject before
+        # the DB preflight (which opens/initializes projects.db) and before
+        # mkdir (re-gate should-fix 4).
+        return bad(handler, "Hermes Projects sync is disabled (HERMES_WEBUI_PROJECTS_DB_SYNC=0)")
     if not projects_write_supported():
         return bad(handler, "Hermes Projects are not available for this install (hermes_cli not reachable)")
     # Also probe DB-open viability before mkdir: an existing-but-corrupt DB
@@ -28343,20 +28360,24 @@ def _handle_workspace_create_project(handler, body):
         return bad(handler, _sanitize_error(e))
     # 2) Ensure the local picker list has it too (harmless if the read bridge
     # already surfaces it; save_workspaces dedupe keeps this cheap).
+    # project_mirror marks the row as created FROM the shared store: if the
+    # project is later archived (Desktop/CLI), the merge hides exactly this
+    # row — provenance, not name-matching, is the hiding trigger (re-gate
+    # must-fix 1).
     from api.projects_bridge import merge_hermes_projects, path_key as _path_key
     try:
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
-    new_key = _path_key(str(p))
-    if not any(_path_key(w.get("path", "")) == new_key for w in wss):
-        wss.append({"path": str(p), "name": project_name})
+    new_key = _path_key(str(p), profile=active_profile)
+    if not any(_path_key(w.get("path", ""), profile=active_profile) == new_key for w in wss):
+        wss.append({"path": str(p), "name": project_name, "project_mirror": True})
         try:
             save_workspaces(wss, profile=active_profile)
         except TypeError:
             save_workspaces(wss)
     try:
-        merged = merge_hermes_projects(load_workspaces(profile=active_profile))
+        merged = merge_hermes_projects(load_workspaces(profile=active_profile), profile=active_profile)
     except Exception:
         merged = wss
     return j(handler, {"ok": True, "project": project, "workspaces": merged})
@@ -28374,13 +28395,13 @@ def _handle_workspace_remove(handler, body):
     # symlinked variant could archive the shared project while leaving the
     # local entry behind.
     from api.projects_bridge import path_key as _path_key
-    resolved_path = _path_key(path_str)
+    resolved_path = _path_key(path_str, profile=active_profile)
     try:
         wss = load_workspaces(profile=active_profile)
     except TypeError:
         wss = load_workspaces()
     def _same_path(a: str, b: str) -> bool:
-        return _path_key(a) == _path_key(b)
+        return _path_key(a, profile=active_profile) == _path_key(b, profile=active_profile)
     # Decide shared-backed BEFORE mutating local state: if the picker entry
     # comes from projects.db, the DB archive must succeed first — otherwise
     # the local removal would report success while the next GET restores the
@@ -28389,19 +28410,26 @@ def _handle_workspace_remove(handler, body):
     # than commit a local deletion that the shared store will undo.
     from api.projects_bridge import (
         archive_hermes_project,
+        is_remote_workspace_path,
         load_project_state,
         merge_hermes_projects,
     )
-    _entries, _archived, read_ok = load_project_state()
-    if not read_ok:
-        return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.")
-    try:
-        db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
-    except Exception:
-        db_paths = set()
-    shared_backed = resolved_path in db_paths
+    if is_remote_workspace_path(path_str, profile=active_profile):
+        # Remote target-side path: projects.db is host-local — a remote path
+        # is never DB-owned, and its host-spelling collision must not trigger
+        # an archive of an unrelated host project (re-gate must-fix 2).
+        shared_backed = False
+    else:
+        _entries, _archived, read_ok = load_project_state()
+        if not read_ok:
+            return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.")
+        try:
+            db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
+        except Exception:
+            db_paths = set()
+        shared_backed = resolved_path in db_paths
     if shared_backed:
-        result = archive_hermes_project(resolved_path)
+        result = archive_hermes_project(resolved_path, profile=active_profile)
         if not result.get("archived") and result.get("reason") != "not-found":
             if result.get("reason") == "ambiguous-path":
                 return bad(
@@ -28423,18 +28451,18 @@ def _handle_workspace_remove(handler, body):
     # #5763 read bridge: projects.db re-appends its projects on every list
     # poll, so removing the local workspace alone makes the delete appear to
     # do nothing. Archive the owning DB project too.
-    if not shared_backed:
+    if not shared_backed and not is_remote_workspace_path(path_str, profile=active_profile):
         # Local-only path: best-effort archive in case the bridge view was
         # stale (fail-safe, never raises).
         try:
-            archive_hermes_project(resolved_path)
+            archive_hermes_project(resolved_path, profile=active_profile)
         except Exception:
             logger.debug("workspace remove: project archive failed for %s", resolved_path)
     # Return the merged post-mutation projection (same view as GET): the
     # filtered local list alone would omit surviving DB-only neighbors and
     # make them vanish from the picker until the next poll (re-gate finding 1).
     try:
-        merged = merge_hermes_projects(wss)
+        merged = merge_hermes_projects(wss, profile=active_profile)
     except Exception:
         merged = wss
     return j(handler, {"ok": True, "workspaces": merged})
@@ -28452,17 +28480,34 @@ def _handle_workspace_rename(handler, body):
     except TypeError:
         wss = load_workspaces()
     from api.projects_bridge import path_key as _path_key
-    target_key = _path_key(path_str)
+    target_key = _path_key(path_str, profile=active_profile)
     for w in wss:
-        if _path_key(w.get("path", "")) == target_key:
+        if _path_key(w.get("path", ""), profile=active_profile) == target_key:
             w["name"] = name
             break
     else:
         # Not in the local list: a DB-only project (created from Desktop/CLI)
         # still appears in the picker via the read bridge — rename it in the
         # DB, which is authoritative for the name of a path it owns.
-        from api.projects_bridge import merge_hermes_projects, rename_hermes_project
-        result = rename_hermes_project(path_str, name)
+        # Check OWNERSHIP first via the read path (works without a writer):
+        # a path no project owns is a 404 even when the writer is
+        # unreachable — a 500 here misreports "workspace not found" as a
+        # server fault (re-gate low).
+        from api.projects_bridge import is_remote_workspace_path, load_project_state, merge_hermes_projects, rename_hermes_project
+        if is_remote_workspace_path(path_str, profile=active_profile):
+            # Remote target-side path: never owned by the host projects.db
+            # (re-gate must-fix 2). Not in the local list either -> not found.
+            return bad(handler, "Workspace not found", 404)
+        _entries, _archived, read_ok = load_project_state()
+        if not read_ok:
+            return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.", 500)
+        try:
+            _db_keys = {_path_key(e["path"]) for e in _entries if e.get("path")}
+        except Exception:
+            _db_keys = set()
+        if target_key not in _db_keys:
+            return bad(handler, "Workspace not found", 404)
+        result = rename_hermes_project(path_str, name, profile=active_profile)
         if not result.get("renamed"):
             if result.get("reason") in ("not-found", "no-db", "disabled"):
                 return bad(handler, "Workspace not found", 404)
@@ -28477,7 +28522,7 @@ def _handle_workspace_rename(handler, body):
             # driver error): a 200 here would be undone by the next GET.
             return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
         try:
-            merged = merge_hermes_projects(load_workspaces(profile=active_profile))
+            merged = merge_hermes_projects(load_workspaces(profile=active_profile), profile=active_profile)
         except TypeError:
             merged = merge_hermes_projects(load_workspaces())
         except Exception:
@@ -28488,18 +28533,21 @@ def _handle_workspace_rename(handler, body):
     # rename must not commit a local name the next GET would revert
     # (re-gate finding 2). A failed ownership read is unknown, not proof
     # of local-only (greptile P1): fail closed.
-    from api.projects_bridge import load_project_state, merge_hermes_projects, path_key as _path_key, rename_hermes_project
-    resolved_path = _path_key(path_str)
-    _entries, _archived, read_ok = load_project_state()
-    if not read_ok:
-        return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.", 500)
-    try:
-        db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
-    except Exception:
-        db_paths = set()
-    shared_backed = resolved_path in db_paths
+    from api.projects_bridge import is_remote_workspace_path, load_project_state, merge_hermes_projects, path_key as _path_key, rename_hermes_project
+    resolved_path = _path_key(path_str, profile=active_profile)
+    if is_remote_workspace_path(path_str, profile=active_profile):
+        shared_backed = False
+    else:
+        _entries, _archived, read_ok = load_project_state()
+        if not read_ok:
+            return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.", 500)
+        try:
+            db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
+        except Exception:
+            db_paths = set()
+        shared_backed = resolved_path in db_paths
     if shared_backed:
-        result = rename_hermes_project(resolved_path, name)
+        result = rename_hermes_project(resolved_path, name, profile=active_profile)
         if not result.get("renamed") and result.get("reason") != "not-found":
             if result.get("reason") == "ambiguous-path":
                 return bad(
@@ -28513,16 +28561,16 @@ def _handle_workspace_rename(handler, body):
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
-    if not shared_backed:
+    if not shared_backed and not is_remote_workspace_path(path_str, profile=active_profile):
         # Local-only path: best-effort DB rename in case the bridge view was
         # stale (fail-safe, never raises).
         try:
-            rename_hermes_project(path_str, name)
+            rename_hermes_project(path_str, name, profile=active_profile)
         except Exception:
             logger.debug("workspace rename: project rename failed for %s", path_str)
     # Merged projection so DB-only neighbors survive in the response view.
     try:
-        merged = merge_hermes_projects(wss)
+        merged = merge_hermes_projects(wss, profile=active_profile)
     except Exception:
         merged = wss
     return j(handler, {"ok": True, "workspaces": merged})
@@ -28558,23 +28606,25 @@ def _handle_workspace_reorder(handler, body):
     seen: set[str] = set()
     for p in paths:
         p = p.strip()
-        key = _path_key(p)
+        key = _path_key(p, profile=active_profile)
         if key in seen:
             # Same directory under two spellings ('/x/p' and '/x/p/'): the
             # first wins; a second row would persist a duplicate (deep-audit P2).
             continue
-        local_hit = next((w for w in wss if _path_key(w.get("path", "")) == key), None)
+        local_hit = next((w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == key), None)
         if local_hit is not None:
             reordered.append(local_hit)
             seen.add(key)
         elif key in db_by_path:
             entry = db_by_path[key]
-            row = {"path": entry["path"], "name": entry["name"]}
+            # Materialized from the shared store -> mirror provenance, so a
+            # later archive hides exactly this row (must-fix 1 contract).
+            row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
             reordered.append(row)
             seen.add(key)
     # Append any workspaces not mentioned (safety net)
     for w in wss:
-        if _path_key(w.get("path", "")) not in seen:
+        if _path_key(w.get("path", ""), profile=active_profile) not in seen:
             reordered.append(w)
     try:
         save_workspaces(reordered, profile=active_profile)
@@ -28584,7 +28634,7 @@ def _handle_workspace_reorder(handler, body):
     # Return the merged view so DB-only entries the caller never mentioned
     # still appear (the picker renders this response directly).
     try:
-        merged = merge_hermes_projects(reordered)
+        merged = merge_hermes_projects(reordered, profile=active_profile)
     except Exception:
         merged = reordered
     return j(handler, {"ok": True, "workspaces": merged})
