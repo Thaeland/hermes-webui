@@ -285,21 +285,86 @@ def test_add_remote_alias_succeeds_with_host_symlink(remote_profile, monkeypatch
 
 
 @requires_manager
-def test_archive_rename_refuse_remote_paths(tmp_path, monkeypatch):
-    """A remote path whose host spelling matches a host DB project must not
-    archive/rename that unrelated host project."""
-    from api.projects_bridge import archive_hermes_project, rename_hermes_project
+@requires_manager
+def test_host_owned_path_under_remote_cwd_still_archives(tmp_path, monkeypatch):
+    """Deep-audit 2b: projects.db is HOST-local. A host DB project whose path
+    string falls under a remote profile's terminal.cwd is still host-owned —
+    remove must archive it (host-keyed), not treat remoteness as proof of
+    non-ownership (that gate silently reverted removals: the next GET
+    re-appended the un-archived project)."""
+    from api.routes import _handle_workspace_remove
 
-    monkeypatch.setattr("api.workspace._remote_terminal_cwd", lambda profile=None: "/remote")
+    cwd = tmp_path / "remote"
+    cwd.mkdir()
+    app = cwd / "app"
+    app.mkdir()
+    monkeypatch.setattr("api.workspace._remote_terminal_cwd", lambda profile=None: str(cwd))
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
     _make_projects_db(tmp_path, [
-        {"id": "p1", "slug": "a", "name": "Host Proj", "folders": ["/remote/x"]},
+        {"id": "p1", "slug": "a", "name": "Host Proj", "folders": [str(app)]},
     ])
-    assert archive_hermes_project("/remote/x", profile_home=tmp_path, profile="default") \
-        == {"archived": False, "reason": "remote-path"}
-    assert rename_hermes_project("/remote/x", "Hijacked", profile_home=tmp_path, profile="default") \
-        == {"renamed": False, "reason": "remote-path"}
-    # Host-local calls (profile=None) still work — the guard is opt-in per call.
-    assert archive_hermes_project("/remote/x", profile_home=tmp_path).get("archived") is True
+    saved = {}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", return_value=[{"path": str(app), "name": "Host Proj", "project_mirror": True}]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, **kw: saved.setdefault("wss", list(w))):
+        _handle_workspace_remove(handler, {"path": str(app)})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    conn = sqlite3.connect(tmp_path / "projects.db")
+    try:
+        assert conn.execute("SELECT archived FROM projects WHERE id='p1'").fetchone()[0] == 1, \
+            "host-owned project under a remote cwd must archive on remove"
+    finally:
+        conn.close()
+
+
+@requires_manager
+def test_merge_no_duplicate_rows_for_host_project_under_remote_cwd(tmp_path, monkeypatch):
+    """Deep-audit 2a: with a remote profile, a local row and the DB project
+    for the SAME directory must merge into one row even when the host
+    realpath differs from the lexical spelling (host symlink under the remote
+    cwd). Row<->DB comparisons key the host form on both sides."""
+    from api.projects_bridge import merge_hermes_projects
+
+    cwd = tmp_path / "remote"
+    real = cwd / "real"
+    real.mkdir(parents=True)
+    alias = cwd / "alias"
+    alias.symlink_to(real)
+    monkeypatch.setattr("api.workspace._remote_terminal_cwd", lambda profile=None: str(cwd))
+    # DB stores the RESOLVED host path; the local row carries the alias
+    # spelling. Host-keyed comparison must fold them to one entry.
+    _make_projects_db(tmp_path, [
+        {"id": "p1", "slug": "a", "name": "HostProj", "folders": [str(real)]},
+    ])
+    merged = merge_hermes_projects(
+        [{"path": str(alias), "name": "alias"}], profile_home=tmp_path, profile="default")
+    same = [w for w in merged if w["path"] in (str(alias), str(real))]
+    assert len(same) == 1, f"one directory must list once: {merged}"
+    assert same[0]["name"] == "HostProj"  # DB name override applied
+
+
+@requires_manager
+def test_create_project_stamps_existing_plain_row(tmp_path, monkeypatch):
+    """Deep-audit finding 1: plain add first, then register the same folder as
+    a project (box ticked) — the EXISTING local row must gain mirror
+    provenance, or a later archive leaves an un-hidable mirror that also
+    blocks re-add."""
+    from api.routes import _handle_workspace_create_project
+
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    target = tmp_path / "srv" / "proj"
+    target.mkdir(parents=True)
+    _make_projects_db(tmp_path, [])
+    state = {"wss": [{"path": str(target), "name": "proj"}]}  # plain row, no flag
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_create_project(handler, {"path": str(target), "name": "Proj", "create": True})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert any(w.get("project_mirror") for w in state["wss"]), \
+        f"existing row must gain provenance: {state['wss']}"
 
 
 # ── Finding 4 (should-fix): kill switch must not write ──────────────────────
