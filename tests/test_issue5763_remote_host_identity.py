@@ -222,28 +222,73 @@ def test_merge_remote_alias_keeps_label_and_native_row(remote_alias_scenario):
 
 @requires_manager
 def test_reorder_remote_alias_persists_remote_row_not_host_project(remote_alias_scenario, monkeypatch):
-    """Reviewer must-fix covers reorder's DB-owner selection: a dragged
-    remote path with NO local row must not materialize a copy of the
-    coincidentally-matching host project (old head persisted
-    {path: real, name: HostProj, project_mirror: True} over the remote
-    spelling). A dragged remote row that DOES exist locally keeps its own
-    label and gains no native provenance."""
+    """Reviewer must-fix covers reorder's DB-owner selection: the saved
+    remote alias (local row, no mirror provenance) must keep its own row and
+    label when dragged — never collapse onto the coincidentally-matching
+    host project."""
     from api.routes import _handle_workspace_reorder
 
     s = remote_alias_scenario
-    # A second remote spelling of the same host target, not in the saved list.
-    alias2 = s["cwd"] / "alias2"
-    alias2.symlink_to(s["real"])
     state = {"wss": [{"path": s["alias_str"], "name": "Alias"}]}
     handler = _make_handler()
     with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
          patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
-        _handle_workspace_reorder(handler, {"paths": [str(alias2), s["alias_str"]]})
+        _handle_workspace_reorder(handler, {"paths": [s["alias_str"]]})
     assert handler.send_response.call_args[0][0] == 200, _response(handler)
     assert not any(w.get("project_mirror") for w in state["wss"]), \
-        f"remote spellings must never materialize native mirror rows: {state['wss']}"
+        f"remote row must not gain native provenance from a realpath coincidence: {state['wss']}"
     alias_rows = [w for w in state["wss"] if w["path"] == s["alias_str"]]
     assert len(alias_rows) == 1 and alias_rows[0]["name"] == "Alias", \
         f"reorder must not overwrite the remote label with the host project name: {state['wss']}"
-    assert not any(w["path"] == s["real_str"] and w.get("project_mirror") for w in state["wss"]), \
-        f"the host project must not be materialized over the remote alias: {state['wss']}"
+
+
+# ── greptile P1 (head c4ef87b5): DB-only shared projects under a remote cwd
+# must stay operable from the picker. A path with NO local row can only be in
+# the picker because it came FROM projects.db (Desktop/CLI-created) — it is a
+# native entry even when its spelling falls under a remote terminal.cwd.
+
+
+@requires_manager
+def test_rename_db_only_project_under_remote_cwd_renames_shared_store(remote_alias_scenario):
+    from api.routes import _handle_workspace_rename
+
+    s = remote_alias_scenario
+    state = {"wss": []}  # no local row: the picker row came from the DB
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_rename(handler, {"path": s["real_str"], "name": "Renamed Shared"})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert _db_state(s["db"])["name"] == "Renamed Shared", \
+        "a DB-only shared project under a remote cwd must remain renamable (greptile P1)"
+
+
+@requires_manager
+def test_remove_db_only_project_under_remote_cwd_archives(remote_alias_scenario):
+    from api.routes import _handle_workspace_remove
+
+    s = remote_alias_scenario
+    state = {"wss": []}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_remove(handler, {"path": s["real_str"]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert _db_state(s["db"])["archived"] == 1, \
+        "removing a DB-only shared project under a remote cwd must archive it (greptile P1)"
+
+
+@requires_manager
+def test_reorder_db_only_project_under_remote_cwd_persists(remote_alias_scenario):
+    from api.routes import _handle_workspace_reorder
+
+    s = remote_alias_scenario
+    state = {"wss": []}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_reorder(handler, {"paths": [s["real_str"]]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    rows = [w for w in state["wss"] if w["path"] == s["real_str"]]
+    assert len(rows) == 1 and rows[0].get("project_mirror"), \
+        f"dragged DB-only row must materialize with mirror provenance: {state['wss']}"
