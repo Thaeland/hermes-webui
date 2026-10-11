@@ -28428,6 +28428,7 @@ def _handle_workspace_remove(handler, body):
     # than commit a local deletion that the shared store will undo.
     from api.projects_bridge import (
         archive_hermes_project,
+        is_remote_workspace_path,
         load_project_state,
         merge_hermes_projects,
     )
@@ -28438,7 +28439,16 @@ def _handle_workspace_remove(handler, body):
         db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
     except Exception:
         db_paths = set()
-    shared_backed = host_path in db_paths
+    # Re-gate must-fix (remote-to-host identity): a REMOTE literal must never
+    # acquire native ownership through a host realpath() coincidence — with a
+    # host symlink `alias -> real` and an unrelated native project at `real`,
+    # removing the remote alias workspace must not archive the host project.
+    # Provenance is the only bridge: a persisted mirror row was created FROM
+    # the shared store, so it is a genuine native entry even when its path
+    # string sits under a remote terminal cwd (deep-audit 2b).
+    remote_literal = is_remote_workspace_path(path_str, profile=active_profile)
+    native_provenance = any(w.get("project_mirror") for w in wss if _same_path(w.get("path", ""), path_str))
+    shared_backed = host_path in db_paths and (not remote_literal or native_provenance)
     if shared_backed:
         result = archive_hermes_project(host_path)
         if not result.get("archived") and result.get("reason") != "not-found":
@@ -28462,9 +28472,11 @@ def _handle_workspace_remove(handler, body):
     # #5763 read bridge: projects.db re-appends its projects on every list
     # poll, so removing the local workspace alone makes the delete appear to
     # do nothing. Archive the owning DB project too.
-    if not shared_backed:
+    if not shared_backed and not remote_literal:
         # Local-only path: best-effort archive in case the bridge view was
-        # stale (fail-safe, never raises).
+        # stale (fail-safe, never raises). NEVER for a remote literal — its
+        # host realpath could coincide with an unrelated native project
+        # (re-gate must-fix: remove of a remote alias archived the host project).
         try:
             archive_hermes_project(host_path)
         except Exception:
@@ -28512,8 +28524,13 @@ def _handle_workspace_rename(handler, body):
             _db_keys = {_path_key(e["path"]) for e in _entries if e.get("path")}
         except Exception:
             _db_keys = set()
-        if _path_key(path_str) not in _db_keys:
-            # Host key: projects.db is host-local (deep-audit 2b).
+        from api.projects_bridge import is_remote_workspace_path
+        if is_remote_workspace_path(path_str, profile=active_profile) or _path_key(path_str) not in _db_keys:
+            # Host key: projects.db is host-local (deep-audit 2b). A REMOTE
+            # literal is never DB-owned without a local mirror row — its host
+            # realpath coincidence must not reach a native project (re-gate
+            # must-fix); this branch only runs when no local row matched, so
+            # there is no provenance to consult here.
             return bad(handler, "Workspace not found", 404)
         result = rename_hermes_project(path_str, name)
         if not result.get("renamed"):
@@ -28550,7 +28567,13 @@ def _handle_workspace_rename(handler, body):
         db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
     except Exception:
         db_paths = set()
-    shared_backed = host_path in db_paths
+    from api.projects_bridge import is_remote_workspace_path
+    # Re-gate must-fix (remote-to-host identity): same provenance rule as
+    # remove — a remote literal renames its own label locally, never the
+    # native project its host realpath happens to point at.
+    remote_literal = is_remote_workspace_path(path_str, profile=active_profile)
+    native_provenance = any(w.get("project_mirror") for w in wss if _path_key(w.get("path", ""), profile=active_profile) == target_key)
+    shared_backed = host_path in db_paths and (not remote_literal or native_provenance)
     if shared_backed:
         result = rename_hermes_project(host_path, name)
         if not result.get("renamed") and result.get("reason") != "not-found":
@@ -28566,9 +28589,11 @@ def _handle_workspace_rename(handler, body):
         save_workspaces(wss, profile=active_profile)
     except TypeError:
         save_workspaces(wss)
-    if not shared_backed:
+    if not shared_backed and not remote_literal:
         # Local-only path: best-effort DB rename in case the bridge view was
-        # stale (fail-safe, never raises).
+        # stale (fail-safe, never raises). NEVER for a remote literal — its
+        # host realpath could coincide with an unrelated native project
+        # (re-gate must-fix: rename of a remote alias renamed the host project).
         try:
             rename_hermes_project(path_str, name)
         except Exception:
@@ -28601,7 +28626,12 @@ def _handle_workspace_reorder(handler, body):
     # picker via the read bridge; without a local row their dragged position
     # cannot persist and the response silently drops them. Materialize a local
     # row for any requested path the DB owns.
-    from api.projects_bridge import load_hermes_project_workspaces, merge_hermes_projects, path_key as _path_key
+    from api.projects_bridge import (
+        load_hermes_project_workspaces,
+        merge_hermes_projects,
+        path_key as _path_key,
+    )
+    from api.projects_bridge import is_remote_workspace_path as _is_remote_workspace_path
     db_by_path = {}
     try:
         db_by_path = {_path_key(e["path"]): e for e in load_hermes_project_workspaces()}
@@ -28625,7 +28655,12 @@ def _handle_workspace_reorder(handler, body):
         if local_hit is not None:
             reordered.append(local_hit)
             seen.add(key)
-        elif host_key in db_by_path or key in db_by_path:
+        elif not _is_remote_workspace_path(p, profile=active_profile) and (host_key in db_by_path or key in db_by_path):
+            # A REMOTE literal never materializes from the host store: its
+            # host realpath could coincide with an unrelated native project
+            # (re-gate must-fix — dragging the remote alias would persist the
+            # host project's row over it). Genuine local/native paths keep the
+            # host-keyed lookup (deep-audit 2c).
             entry = db_by_path.get(host_key) or db_by_path[key]
             # Materialized from the shared store -> mirror provenance, so a
             # later archive hides exactly this row (must-fix 1 contract).

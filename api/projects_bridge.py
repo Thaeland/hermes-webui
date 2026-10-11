@@ -78,6 +78,42 @@ def _is_remote_workspace_path(path: str, profile: str | Path | None = None) -> b
         return False
 
 
+def is_remote_workspace_path(path: str, profile: str | Path | None = None) -> bool:
+    """Public probe: True when ``path`` is a target-side remote workspace for
+    ``profile``. Route handlers use this to keep remote literals out of
+    projects.db OWNERSHIP decisions — the shared store is host-local, and a
+    remote path whose spelling coincides with a host directory (host symlink
+    at the same spelling) must never acquire native ownership through that
+    coincidence (re-gate must-fix: remote-to-host identity crossing).
+    Provenance (``project_mirror``) is the only thing that can make a
+    remote-spelled row a genuine native entry."""
+    return profile is not None and _is_remote_workspace_path(str(path), profile=profile)
+
+
+def row_db_key(path: str, profile: str | Path | None = None, *, native_provenance: bool = False) -> str:
+    """Comparison key for a workspace ROW against projects.db.
+
+    projects.db is host-local, so genuine local/native entries key the HOST
+    form (realpath folds symlink spellings of a host directory — deep-audit
+    2a). But a REMOTE literal (target-side SSH/Docker path) keeps its lexical
+    identity: a host symlink at the same spelling must not fold a remote row
+    onto an unrelated host project (re-gate must-fix: the merged projection
+    replacing a remote alias label with a host project name, and rename/
+    remove mutating the host project through the realpath coincidence).
+    ``native_provenance`` (the row's persisted ``project_mirror`` flag) is the
+    only override: a mirror row was created FROM the shared store, so it is a
+    native entry even when its path string sits under a remote terminal cwd
+    (deep-audit 2b: host-owned rows under a remote cwd must stay shared-backed).
+    """
+    if (
+        not native_provenance
+        and profile is not None
+        and _is_remote_workspace_path(str(path), profile=profile)
+    ):
+        return path_key(str(path), profile=profile)
+    return path_key(str(path))
+
+
 def _lexical_key(s: str) -> str:
     return os.path.normcase(os.path.abspath(os.path.expanduser(s))).rstrip("/\\")
 
@@ -286,8 +322,12 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     - DB projects not present locally are appended.
     - A FAILED DB read is not authoritative: local entries pass through
       untouched (no archive-hiding, no renames).
-    ``profile`` is accepted for call-site symmetry; every row<->DB comparison
-    here keys the host form (the DB is host-local) regardless of profile.
+    ``profile`` makes row<->DB keying provenance-aware (re-gate must-fix): a
+    REMOTE literal without ``project_mirror`` provenance keeps its lexical
+    identity and can never fold onto a host project through a host-symlink
+    realpath coincidence; genuine local/native entries (plain local rows and
+    mirror rows) keep the host-canonicalized key because projects.db is
+    host-local (deep-audit 2a/2b).
     Never mutates the input list.
     """
     db_entries, archived, read_ok = load_project_state(profile_home=profile_home)
@@ -307,15 +347,17 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     for w in workspaces:
         entry = dict(w)
         path = entry.get("path", "")
-        # Row<->DB comparisons key the HOST form on BOTH sides: projects.db is
-        # a host-local store, so a local row — even one spelled under a remote
-        # profile's terminal.cwd — matches a DB project by its host-resolved
-        # path. Keying the row lexically while DB entries keyed via realpath
-        # showed two picker rows for one directory when a host symlink
-        # collapsed a DB path under the remote cwd (deep-audit 2a). Row<->row
-        # dedupe elsewhere stays profile-aware so remote spellings never
-        # collapse (must-fix 2).
-        key = path_key(path)
+        # Row<->DB keying (re-gate must-fix, supersedes the blanket host-key
+        # walk-back of 7c990429): projects.db is host-local, so genuine
+        # local/native rows key the HOST form — a local row spelled under a
+        # remote terminal.cwd that is actually host-owned (or a persisted
+        # mirror created FROM the shared store) matches its DB project by
+        # realpath (deep-audit 2a/2b). But a REMOTE literal without mirror
+        # provenance keys lexically: a host symlink at the same spelling must
+        # not replace the remote alias label with an unrelated host project's
+        # name nor drop the native row from the projection.
+        key = row_db_key(path, profile=profile,
+                         native_provenance=bool(entry.get("project_mirror")))
         if entry.get("project_mirror") and archived.get(key) is not None and db_by_path.get(key) is None:
             # Persisted mirror of a retired shared project: hide it. Rows
             # without the provenance flag are ordinary local workspaces and
