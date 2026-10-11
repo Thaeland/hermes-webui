@@ -6127,6 +6127,12 @@ function renderWorkspacesPanel(workspaces){
     const row=document.createElement('div');
     row.className='ws-row';
     row.dataset.path = w.path;
+    // Explicit target identity (#5763 round 3): two picker rows can share a
+    // path spelling (a remote workspace and a native Hermes Project at the
+    // identical path). Actions must carry the row's kind/project_id, never
+    // select by path alone.
+    row.dataset.workspaceKind = w.workspace_kind || '';
+    row.dataset.projectId = w.project_id || '';
     row.draggable=true;
     const isActive = w.path === activePath;
     const activeBadge = isActive ? `<span class="detail-badge active" style="margin-left:6px;font-size:9px;padding:1px 6px">${esc(t('profile_active'))}</span>` : '';
@@ -6138,15 +6144,15 @@ function renderWorkspacesPanel(workspaces){
       </div>`;
     // Click on info area only — not on drag handle
     const info=row.querySelector('.ws-row-info');
-    if(info) info.onclick = (e) => { e.stopPropagation(); openWorkspaceDetail(w.path, row); };
-    if (_currentWorkspaceDetail && _currentWorkspaceDetail.path === w.path) row.classList.add('active');
+    if(info) info.onclick = (e) => { e.stopPropagation(); openWorkspaceDetail(w, row); };
+    if (_currentWorkspaceDetail && _currentWorkspaceDetail === w) row.classList.add('active');
 
     // ── Drag-and-drop reorder ──
     row.addEventListener('dragstart', (e) => {
       // Only allow drag from the grip handle or the row itself
       row.classList.add('dragging');
       e.dataTransfer.effectAllowed='move';
-      e.dataTransfer.setData('text/plain', w.path);
+      e.dataTransfer.setData('text/plain', JSON.stringify({path:w.path, workspace_kind:w.workspace_kind||'', project_id:w.project_id||''}));
       // Required for Firefox drag ghost
       if(e.dataTransfer.setDragImage) e.dataTransfer.setDragImage(row, 0, 0);
     });
@@ -6167,20 +6173,23 @@ function renderWorkspacesPanel(workspaces){
     row.addEventListener('drop', async (e) => {
       e.preventDefault();
       row.classList.remove('drag-over');
-      const fromPath = e.dataTransfer.getData('text/plain');
-      const toPath = w.path;
-      if(fromPath === toPath) return; // Same item, no-op
-      // Compute new order
-      const currentPaths = workspaces.map(ws => ws.path);
-      const fromIdx = currentPaths.indexOf(fromPath);
-      const toIdx = currentPaths.indexOf(toPath);
+      let fromId;
+      try { fromId = JSON.parse(e.dataTransfer.getData('text/plain')); } catch(_) { fromId = {path: e.dataTransfer.getData('text/plain')}; }
+      const toId = {path: w.path, workspace_kind: w.workspace_kind||'', project_id: w.project_id||''};
+      if(fromId.path === toId.path && (fromId.project_id||'') === (toId.project_id||'') && (fromId.workspace_kind||'') === (toId.workspace_kind||'')) return; // Same item, no-op
+      // Compute new order (identity objects: same-spelling remote/native
+      // rows stay distinguishable — #5763 round 3)
+      const currentIds = workspaces.map(ws => ({path: ws.path, workspace_kind: ws.workspace_kind||'', project_id: ws.project_id||''}));
+      const sameId = (a,b) => a.path === b.path && (a.project_id||'') === (b.project_id||'') && (a.workspace_kind||'') === (b.workspace_kind||'');
+      const fromIdx = currentIds.findIndex(x => sameId(x, fromId));
+      const toIdx = currentIds.findIndex(x => sameId(x, toId));
       if(fromIdx < 0 || toIdx < 0) return;
-      currentPaths.splice(fromIdx, 1);
-      currentPaths.splice(toIdx, 0, fromPath);
+      currentIds.splice(fromIdx, 1);
+      currentIds.splice(toIdx, 0, fromId);
       try {
         const res = await api('/api/workspaces/reorder', {
           method: 'POST',
-          body: JSON.stringify({ paths: currentPaths })
+          body: JSON.stringify({ paths: currentIds })
         });
         if(res && res.ok){
           renderWorkspacesPanel(res.workspaces);
@@ -6200,7 +6209,10 @@ function renderWorkspacesPanel(workspaces){
   panel.appendChild(hint);
   // Re-render detail if we have one cached and we're not in a form
   if (_currentWorkspaceDetail && _workspaceMode !== 'create' && _workspaceMode !== 'edit') {
-    const refreshed = workspaces.find(w => w.path === _currentWorkspaceDetail.path);
+    const refreshed = workspaces.find(w => w === _currentWorkspaceDetail)
+      || workspaces.find(w => w.path === _currentWorkspaceDetail.path
+           && (w.project_id||'') === (_currentWorkspaceDetail.project_id||'')
+           && (w.workspace_kind||'') === (_currentWorkspaceDetail.workspace_kind||''));
     if (refreshed) _renderWorkspaceDetail(refreshed);
     else _clearWorkspaceDetail();
   }
@@ -6268,12 +6280,23 @@ function _setWorkspaceHeaderButtons(mode, ws){
   }
 }
 
-function openWorkspaceDetail(path, el){
+function openWorkspaceDetail(pathOrWs, el){
   if (!_workspaceList) return;
-  const ws = _workspaceList.find(w => w.path === path);
+  // Accept the picker row object (preferred — disambiguates same-spelling
+  // remote/native rows) or a legacy path string.
+  let ws = pathOrWs;
+  if (typeof pathOrWs === 'string') {
+    ws = _workspaceList.find(w => w.path === pathOrWs);
+  } else if (pathOrWs && (typeof pathOrWs === 'object')) {
+    ws = _workspaceList.find(w => w === pathOrWs)
+      || _workspaceList.find(w => w.path === pathOrWs.path
+           && (w.project_id||'') === (pathOrWs.project_id||'')
+           && (w.workspace_kind||'') === (pathOrWs.workspace_kind||''))
+      || ws;
+  }
   if (!ws) return;
   document.querySelectorAll('.ws-row').forEach(e => e.classList.remove('active'));
-  const target = el || document.querySelector(`.ws-row[data-path="${CSS.escape(path)}"]`);
+  const target = el || document.querySelector(`.ws-row[data-path="${CSS.escape(ws.path)}"]`);
   if (target) target.classList.add('active');
   _workspacePreFormDetail = null;
   _renderWorkspaceDetail(ws);
@@ -6305,7 +6328,10 @@ async function deleteCurrentWorkspace(){
   const _ok = await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
   if(!_ok) return;
   try{
-    const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify({path})});
+    const body={path};
+    if(_currentWorkspaceDetail.workspace_kind) body.workspace_kind=_currentWorkspaceDetail.workspace_kind;
+    if(_currentWorkspaceDetail.project_id) body.project_id=_currentWorkspaceDetail.project_id;
+    const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify(body)});
     _workspaceList=data.workspaces;
     _clearWorkspaceDetail();
     renderWorkspacesPanel(data.workspaces);
@@ -6398,7 +6424,10 @@ async function saveWorkspaceForm(){
     if (_workspaceMode === 'edit' && _currentWorkspaceDetail) {
       const targetPath = _currentWorkspaceDetail.path;
       const newName = name || _currentWorkspaceDetail.name || '';
-      await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify({ path: targetPath, name: newName }) });
+      const body = { path: targetPath, name: newName };
+      if(_currentWorkspaceDetail.workspace_kind) body.workspace_kind=_currentWorkspaceDetail.workspace_kind;
+      if(_currentWorkspaceDetail.project_id) body.project_id=_currentWorkspaceDetail.project_id;
+      await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify(body) });
       // Refresh list and re-render detail
       const data = await api('/api/workspaces');
       _workspaceList = data.workspaces || [];
@@ -6497,11 +6526,16 @@ document.addEventListener('click',e=>{
   if(!e.target.closest('.workspace-form-path-wrap')) closeWorkspacePathSuggestions();
 });
 
-async function removeWorkspace(path){
+async function removeWorkspace(pathOrWs){
+  const path = (typeof pathOrWs === 'string') ? pathOrWs : (pathOrWs && pathOrWs.path) || '';
+  const ws = (typeof pathOrWs === 'object' && pathOrWs) ? pathOrWs : (_workspaceList||[]).find(w => w.path === path);
   const _rmWs=await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
   if(!_rmWs) return;
   try{
-    const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify({path})});
+    const body={path};
+    if(ws && ws.workspace_kind) body.workspace_kind=ws.workspace_kind;
+    if(ws && ws.project_id) body.project_id=ws.project_id;
+    const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify(body)});
     _workspaceList=data.workspaces;
     renderWorkspacesPanel(data.workspaces);
     showToast(t('workspace_removed'));

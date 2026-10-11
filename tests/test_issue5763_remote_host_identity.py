@@ -350,15 +350,17 @@ def test_reorder_dropped_alias_row_not_materialized_from_host(remote_alias_scena
         f"a remote spelling the DB does not name lexically must not materialize the host row: {state['wss']}"
 
 
-# ── omp P2: spelling equality (no symlink). The host has a PLAIN directory
-# at the identical spelling the DB owns (e.g. /srv/www on both sides). The
-# remote literal must keep its own label in the merged projection — a name
-# override makes rename/remove appear to no-op because the DB name
-# re-asserts on every poll — and the DB entry must not double-list.
+# ── Re-gate round 3 must-fix 1 (supersedes the omp P2 single-row fold):
+# spelling equality (no symlink) — the host has a PLAIN directory at the
+# identical spelling the DB owns (e.g. /srv/www on both sides). The remote
+# workspace and the native Hermes Project are INDEPENDENT targets and must
+# project as TWO rows: the remote row keeps its label and carries
+# workspace_kind='remote', the native row appends with its project_id.
+# Folding to one row made the native project unaddressable.
 
 
 @requires_manager
-def test_merge_remote_literal_equal_spelling_keeps_remote_label(tmp_path, monkeypatch):
+def test_merge_remote_literal_equal_spelling_projects_two_rows(tmp_path, monkeypatch):
     from api.projects_bridge import merge_hermes_projects
 
     same = tmp_path / "srv" / "www"
@@ -375,6 +377,11 @@ def test_merge_remote_literal_equal_spelling_keeps_remote_label(tmp_path, monkey
     wss = [{"path": str(same), "name": "RemoteWWW"}]
     merged = merge_hermes_projects(wss, profile="default")
     rows = [w for w in merged if w["path"] == str(same)]
-    assert len(rows) == 1, f"DB entry must dedupe against the remote row: {merged}"
-    assert rows[0]["name"] == "RemoteWWW", \
+    assert len(rows) == 2, f"independent same-spelling targets must project as two rows: {merged}"
+    remote_row, native_row = rows
+    assert remote_row["name"] == "RemoteWWW", \
         f"remote literal label must survive a spelling-equality DB hit: {merged}"
+    assert remote_row.get("workspace_kind") == "remote", \
+        f"remote row must carry explicit kind: {remote_row}"
+    assert native_row.get("source") == "hermes_project" and native_row.get("project_id") == "p1", \
+        f"native row must carry explicit project identity: {native_row}"

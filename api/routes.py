@@ -30152,6 +30152,14 @@ def _handle_workspace_remove(handler, body):
         return bad(handler, "path is required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
+    # Explicit target identity (re-gate round 3 must-fix 2): the picker row
+    # carries its provenance kind and, for native rows, the projects.db row
+    # id. When present, the server acts on THAT identity instead of
+    # re-inferring provenance from path shape — a replayed or stale request
+    # then fails closed (404 / not-found) instead of selecting a successor
+    # project that later appeared at the same spelling.
+    req_kind = str(body.get("workspace_kind") or "").strip().lower()
+    req_project_id = str(body.get("project_id") or "").strip()
     # Resolve once and use the same key for the local filter and the DB
     # archive: the bridge canonicalizes (realpath/expanduser/case) while the
     # local filter was an exact match, so a "~/x", trailing-slash, or
@@ -30214,6 +30222,40 @@ def _handle_workspace_remove(handler, body):
         except Exception:
             db_lexical = set()
         local_row = next((w for w in wss if _same_path(w.get("path", ""), path_str)), None)
+
+        def _remove_local_and_respond():
+            remaining = [w for w in wss if not _same_path(w["path"], path_str)]
+            try:
+                save_workspaces(remaining, profile=active_profile)
+            except TypeError:
+                save_workspaces(remaining)
+            try:
+                merged = merge_hermes_projects(remaining, profile=active_profile)
+            except Exception:
+                merged = remaining
+            return j(handler, {"ok": True, "workspaces": merged})
+
+        if req_kind == "remote":
+            # Explicit remote-target claim: remove ONLY the saved local row.
+            # A replay after the row is gone (or a claim against a mirror row)
+            # is stale -> 404; it must never fall through to the no-local-row
+            # lane and archive a native project at a coinciding spelling.
+            if local_row is None or local_row.get("project_mirror"):
+                return bad(handler, "Workspace not found", 404)
+            return _remove_local_and_respond()
+        if req_project_id:
+            # Explicit native identity: archive EXACTLY that project. Already
+            # archived / deleted is idempotent success (clean up any local
+            # mirror row); a writer failure fails closed before local mutation.
+            result = archive_hermes_project(path_str, project_id=req_project_id)
+            if not result.get("archived") and result.get("reason") != "not-found":
+                return bad(
+                    handler,
+                    "Could not archive the shared Hermes Project (projects writer unavailable); "
+                    "workspace left unchanged.",
+                )
+            return _remove_local_and_respond()
+
         if local_row is not None:
             remote_literal = remote_spelled and not local_row.get("project_mirror")
         else:
@@ -30267,6 +30309,9 @@ def _handle_workspace_rename(handler, body):
         return bad(handler, "path and name are required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
+    # Explicit target identity — see _handle_workspace_remove (round 3).
+    req_kind = str(body.get("workspace_kind") or "").strip().lower()
+    req_project_id = str(body.get("project_id") or "").strip()
     with _PROJECTS_CATALOG_LOCK:
         try:
             wss = load_workspaces(profile=active_profile)
@@ -30274,10 +30319,56 @@ def _handle_workspace_rename(handler, body):
             wss = load_workspaces()
         from api.projects_bridge import path_key as _path_key
         target_key = _path_key(path_str, profile=active_profile)
-        for w in wss:
-            if _path_key(w.get("path", ""), profile=active_profile) == target_key:
-                w["name"] = name
-                break
+        local_hit = next((w for w in wss
+                          if _path_key(w.get("path", ""), profile=active_profile) == target_key), None)
+
+        def _rename_local_and_respond():
+            for w in wss:
+                if _path_key(w.get("path", ""), profile=active_profile) == target_key:
+                    w["name"] = name
+            try:
+                save_workspaces(wss, profile=active_profile)
+            except TypeError:
+                save_workspaces(wss)
+            try:
+                merged = merge_hermes_projects(wss, profile=active_profile)
+            except Exception:
+                merged = wss
+            return j(handler, {"ok": True, "workspaces": merged})
+
+        if req_kind == "remote":
+            # Explicit remote-target claim: rename ONLY the saved local row,
+            # never the native project its spelling happens to coincide with.
+            # Stale claim (row gone) or mirror provenance -> 404.
+            if local_hit is None or local_hit.get("project_mirror"):
+                return bad(handler, "Workspace not found", 404)
+            return _rename_local_and_respond()
+        if req_project_id:
+            # Explicit native identity: rename EXACTLY that project; a stale
+            # request renames nothing rather than a path-selected successor.
+            from api.projects_bridge import merge_hermes_projects, rename_hermes_project
+            result = rename_hermes_project(path_str, name, project_id=req_project_id)
+            if not result.get("renamed"):
+                if result.get("reason") in ("not-found", "no-db", "disabled"):
+                    return bad(handler, "Workspace not found", 404)
+                return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
+            # Mirror rows keep a local copy of the name; refresh it too.
+            if local_hit is not None:
+                local_hit["name"] = name
+                try:
+                    save_workspaces(wss, profile=active_profile)
+                except TypeError:
+                    save_workspaces(wss)
+            try:
+                merged = merge_hermes_projects(load_workspaces(profile=active_profile), profile=active_profile)
+            except TypeError:
+                merged = merge_hermes_projects(load_workspaces())
+            except Exception:
+                merged = wss
+            return j(handler, {"ok": True, "workspaces": merged})
+
+        if local_hit is not None:
+            local_hit["name"] = name
         else:
             # Not in the local list: a DB-only project (created from Desktop/CLI)
             # still appears in the picker via the read bridge — rename it in the
@@ -30436,23 +30527,59 @@ def _handle_workspace_reorder(handler, body):
         except Exception:
             pass
         reordered = []
-        seen: set[str] = set()
-        for p in paths:
-            p = p.strip()
+        seen: set = set()  # path keys (legacy) or (path_key, project_id, kind) identities
+        for item in paths:
+            # Reorder entries are path strings (legacy picker) or identity
+            # objects {path, workspace_kind, project_id} (round 3): the kind
+            # decides whether a no-local-row entry may materialize at all, so a
+            # dragged remote row can never materialize a coinciding host project.
+            if isinstance(item, dict):
+                p = str(item.get("path", "")).strip()
+                item_kind = str(item.get("workspace_kind") or "").strip().lower()
+                item_project_id = str(item.get("project_id") or "").strip()
+            else:
+                p = str(item).strip()
+                item_kind = ""
+                item_project_id = ""
+            if not p:
+                continue
             key = _path_key(p, profile=active_profile)
             # DB lookup uses the HOST key: projects.db is host-local, so a path
             # under a remote terminal cwd must still find a host project whose
             # realpath matches (deep-audit 2c: profile-keyed db_by_path missed
             # these and the dragged position never persisted).
             host_key = _path_key(p)
-            if key in seen:
-                # Same directory under two spellings ('/x/p' and '/x/p/'): the
-                # first wins; a second row would persist a duplicate (deep-audit P2).
+            # Dedupe by FULL identity, not path alone (round 3 must-fix 1): a
+            # remote row and a native project may share one spelling and are two
+            # persistable rows. Legacy path-only entries keep the old per-path
+            # first-wins rule (deep-audit P2: '/x/p' vs '/x/p/' spellings).
+            ident = (key, item_project_id, item_kind) if (item_project_id or item_kind) else key
+            if ident in seen or (item_project_id or item_kind) and key in seen and not item_project_id:
+                continue
+            if not (item_project_id or item_kind) and any(
+                s[0] == key for s in seen if isinstance(s, tuple)
+            ):
                 continue
             local_hit = next((w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == key), None)
+            if item_project_id and local_hit is not None and not local_hit.get("project_mirror"):
+                # The dragged native row is NOT this plain local row (a remote or
+                # local workspace at the same spelling is a different target);
+                # fall through to DB materialization of the carried project.
+                local_hit = None
             if local_hit is not None:
+                if item_kind == "remote" and local_hit.get("project_mirror"):
+                    # Stale/contradictory claim: a mirror row is not a remote
+                    # literal; skip rather than reorder under the wrong identity.
+                    continue
+                if item_project_id and not local_hit.get("project_mirror"):
+                    # Contradictory: a plain local row is not a native project.
+                    continue
                 reordered.append(local_hit)
-                seen.add(key)
+                seen.add(ident)
+            elif item_kind == "remote":
+                # Explicit remote claim with no local row: stale (row already
+                # removed) — never materialize anything for it.
+                continue
             elif host_key in db_by_path or key in db_by_path:
                 # No local row: the dragged picker row came FROM projects.db
                 # (Desktop/CLI-created), a native entry even when its spelling
@@ -30470,15 +30597,25 @@ def _handle_workspace_reorder(handler, body):
                         _db_lexical = set()
                     if lexical_key(p) not in _db_lexical:
                         continue
-                entry = db_by_path.get(host_key) or db_by_path[key]
+                if item_project_id:
+                    # Explicit native identity: materialize EXACTLY that project
+                    # (round 3 must-fix 1: two same-spelling targets — the id
+                    # disambiguates which DB row the dragged row showed).
+                    entry = next(
+                        (e for e in db_by_path.values() if str(e.get("project_id") or "") == item_project_id),
+                        None,
+                    ) or db_by_path.get(host_key) or db_by_path[key]
+                else:
+                    entry = db_by_path.get(host_key) or db_by_path[key]
                 # Materialized from the shared store -> mirror provenance, so a
                 # later archive hides exactly this row (must-fix 1 contract).
                 row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
                 reordered.append(row)
-                seen.add(key)
+                seen.add(ident)
         # Append any workspaces not mentioned (safety net)
+        seen_paths = {s[0] if isinstance(s, tuple) else s for s in seen}
         for w in wss:
-            if _path_key(w.get("path", ""), profile=active_profile) not in seen:
+            if _path_key(w.get("path", ""), profile=active_profile) not in seen_paths:
                 reordered.append(w)
         try:
             save_workspaces(reordered, profile=active_profile)
