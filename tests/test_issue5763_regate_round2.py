@@ -323,10 +323,13 @@ def test_host_owned_path_under_remote_cwd_still_archives(tmp_path, monkeypatch):
 
 @requires_manager
 def test_merge_no_duplicate_rows_for_host_project_under_remote_cwd(tmp_path, monkeypatch):
-    """Deep-audit 2a: with a remote profile, a local row and the DB project
-    for the SAME directory must merge into one row even when the host
-    realpath differs from the lexical spelling (host symlink under the remote
-    cwd). Row<->DB comparisons key the host form on both sides."""
+    """Deep-audit 2a + re-gate must-fix: with a remote profile, a NATIVE row
+    (mirror provenance) and the DB project for the SAME directory must merge
+    into one row even when the host realpath differs from the lexical spelling
+    (host symlink under the remote cwd). Provenance is what makes the row a
+    genuine local/native entry eligible for host canonicalization; a plain
+    row under a remote cwd is a remote literal and keeps lexical identity
+    (see test_merge_remote_alias_keeps_label_and_native_row)."""
     from api.projects_bridge import merge_hermes_projects
 
     cwd = tmp_path / "remote"
@@ -336,12 +339,14 @@ def test_merge_no_duplicate_rows_for_host_project_under_remote_cwd(tmp_path, mon
     alias.symlink_to(real)
     monkeypatch.setattr("api.workspace._remote_terminal_cwd", lambda profile=None: str(cwd))
     # DB stores the RESOLVED host path; the local row carries the alias
-    # spelling. Host-keyed comparison must fold them to one entry.
+    # spelling WITH mirror provenance. Host-keyed comparison must fold them
+    # to one entry.
     _make_projects_db(tmp_path, [
         {"id": "p1", "slug": "a", "name": "HostProj", "folders": [str(real)]},
     ])
     merged = merge_hermes_projects(
-        [{"path": str(alias), "name": "alias"}], profile_home=tmp_path, profile="default")
+        [{"path": str(alias), "name": "alias", "project_mirror": True}],
+        profile_home=tmp_path, profile="default")
     same = [w for w in merged if w["path"] in (str(alias), str(real))]
     assert len(same) == 1, f"one directory must list once: {merged}"
     assert same[0]["name"] == "HostProj"  # DB name override applied
