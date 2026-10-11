@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # path -> ((db stat, wal stat), active_entries, archived_by_path)
 _cache: dict[
     str,
-    tuple[tuple[tuple[float, int] | None, tuple[float, int] | None], list[tuple[str, str]], dict[str, str]],
+    tuple[tuple[tuple[float, int] | None, tuple[float, int] | None], list[tuple[str, str, str]], dict[str, set[str]]],
 ] = {}
 _cache_lock = threading.Lock()
 
@@ -175,12 +175,16 @@ def _projects_db_path(profile_home: Path | None) -> Path | None:
     return db if db.is_file() else None
 
 
-def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
+def _query_projects(db: Path) -> tuple[list[tuple[str, str, str]], dict[str, set[str]]]:
     """Return ``(active_entries, archived_by_path)`` for the profile's projects.
 
     A project's workspace path is its primary folder when set, otherwise any
     attached folder (lowest ``added_at`` for determinism). Projects with no
     folders at all are skipped: a workspace entry needs a real directory.
+
+    Active entries are ``(path, name, project_id)`` triples — the row id is
+    the explicit native identity the picker carries through rename/remove
+    (re-gate round 3 must-fix 1).
 
     Archived projects are returned as ``path_key -> {names}`` so the merge can
     hide local MIRROR rows whose shared project was archived from Desktop/CLI
@@ -200,7 +204,7 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT p.name AS name, p.archived AS archived,
+            SELECT p.id AS id, p.name AS name, p.archived AS archived,
                    COALESCE(
                        (SELECT pf.path FROM project_folders pf
                          WHERE pf.project_id = p.id AND pf.is_primary = 1
@@ -233,7 +237,7 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
         if not name or path in seen:
             continue
         seen.add(path)
-        out.append((path, name))
+        out.append((path, name, str(r["id"])))
     return out, archived
 
 
@@ -291,7 +295,17 @@ def load_project_state(profile_home: Path | None = None) -> tuple[list[dict], di
                     return [], {}, False
                 _cache[key] = ((db_stamp, wal_stamp), entries, archived)
         return (
-            [{"path": p, "name": n, "source": "hermes_project"} for p, n in entries],
+            [
+                {
+                    "path": p, "name": n, "source": "hermes_project",
+                    # Explicit native identity (re-gate round 3 must-fix 1):
+                    # the picker carries the projects.db row id through the
+                    # projection so rename/remove/reorder act on the EXACT
+                    # project the row shows, never a path-selected successor.
+                    "project_id": pid,
+                }
+                for p, n, pid in entries
+            ],
             {k: set(v) for k, v in archived.items()},
             True,
         )
@@ -354,15 +368,24 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     for w in workspaces:
         entry = dict(w)
         path = entry.get("path", "")
+        remote_literal_row = bool(
+            profile is not None
+            and not entry.get("project_mirror")
+            and _is_remote_workspace_path(str(path), profile=profile)
+        )
+        if remote_literal_row:
+            # Explicit remote-target identity (re-gate round 3): the picker
+            # carries the kind through rename/remove so the server never has
+            # to re-infer provenance from path shape after the row vanishes.
+            entry["workspace_kind"] = "remote"
         # Row<->DB keying (re-gate must-fix, supersedes the blanket host-key
         # walk-back of 7c990429): projects.db is host-local, so genuine
         # local/native rows key the HOST form — a local row spelled under a
         # remote terminal.cwd that is actually host-owned (or a persisted
         # mirror created FROM the shared store) matches its DB project by
-        # realpath (deep-audit 2a/2b). But a REMOTE literal without mirror
-        # provenance keys lexically: a host symlink at the same spelling must
-        # not replace the remote alias label with an unrelated host project's
-        # name nor drop the native row from the projection.
+        # realpath (deep-audit 2a/2b). But a REMOTE literal keys lexically: a
+        # host symlink at the same spelling must not replace the remote alias
+        # label with an unrelated host project's name.
         key = row_db_key(path, profile=profile,
                          native_provenance=bool(entry.get("project_mirror")))
         if entry.get("project_mirror") and archived.get(key) is not None and db_by_path.get(key) is None:
@@ -371,22 +394,12 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
             # always survive an archived-name match at their path.
             continue
         hit = db_by_path.get(key)
-        if hit is not None:
-            # A remote literal can only hit lexically when the DB names the
-            # IDENTICAL spelling (no symlink — e.g. /srv/www exists on both
-            # host and target and the DB owns it). Overriding the label there
-            # makes the remote workspace unmanageable (rename/remove appear
-            # to no-op because the DB name re-asserts every poll), so the
-            # remote label wins; the row still dedupes the DB entry to keep
-            # one picker row, and after the local row is removed the DB
-            # project re-appends under its own name (omp P2).
-            if not (
-                profile is not None
-                and not entry.get("project_mirror")
-                and _is_remote_workspace_path(str(path), profile=profile)
-            ):
-                entry["name"] = hit["name"]
-                entry["source"] = "hermes_project"
+        if hit is not None and not remote_literal_row:
+            entry["name"] = hit["name"]
+            entry["source"] = "hermes_project"
+            # Verified native identity for the picker to carry through
+            # rename/remove/reorder (re-gate round 3 must-fix 1).
+            entry["project_id"] = hit["project_id"]
             used.add(key)
         merged.append(entry)
     for e in db_entries:
@@ -394,6 +407,13 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
         if key not in used:
             # Dedupe by key: two DB rows for one directory (e.g. registered
             # through different symlink spellings) must not both appear.
+            # A REMOTE literal that hit lexically (identical spelling on both
+            # sides, no symlink) does NOT mark the key used: the remote row
+            # and the native project are INDEPENDENT targets and must project
+            # as two rows — the remote row keeps its label and remote kind,
+            # the native row appends with its project_id (re-gate round 3
+            # must-fix 1; the old single-row fold made the native project
+            # unaddressable and its actions select by path alone).
             used.add(key)
             merged.append(dict(e))
     return merged
@@ -624,7 +644,7 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
 
 _ARCHIVE_PROJECT_PROG = """
 import json, os, sys
-db_path, path, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+db_path, match_mode, match_value, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sys.path.insert(0, agent_dir)
 def _key(p):
     try:
@@ -640,13 +660,24 @@ try:
         # concurrent writer cannot swap the owner between our read and write
         # (re-gate must-fix 3; mirrors the in-process implementation).
         conn.execute("BEGIN IMMEDIATE")
-        key = _key(path)
-        matches = []
-        for p_ in pdb.list_projects(conn, include_archived=False):
-            primary = p_.primary_path or next(
-                (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
-            if primary and _key(primary) == key:
-                matches.append(p_)
+        if match_mode == "id":
+            # Explicit native identity (re-gate round 3 must-fix 2): archive
+            # EXACTLY the project the picker row came from; a stale request
+            # whose project is gone is not-found, never a path-selected
+            # successor at the same spelling.
+            row = conn.execute(
+                "SELECT id FROM projects WHERE id = ? AND archived = 0", (match_value,)
+            ).fetchone()
+            matches = [row[0]] if row else []
+        else:
+            key = _key(match_value)
+            matches = []
+            for p_ in pdb.list_projects(conn, include_archived=False):
+                primary = p_.primary_path or next(
+                    (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
+                if primary and _key(primary) == key:
+                    matches.append(p_)
+            matches = [m.id for m in matches]
         if not matches:
             conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "archived": False, "reason": "not-found"}))
@@ -654,9 +685,9 @@ try:
             conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "archived": False, "reason": "ambiguous-path", "count": len(matches)}))
         else:
-            ok = conn.execute("UPDATE projects SET archived = 1 WHERE id = ?", (matches[0].id,)).rowcount
+            ok = conn.execute("UPDATE projects SET archived = 1 WHERE id = ?", (matches[0],)).rowcount
             conn.execute("COMMIT")
-            print(json.dumps({"ok": True, "archived": bool(ok), "id": matches[0].id}))
+            print(json.dumps({"ok": True, "archived": bool(ok), "id": matches[0]}))
     finally:
         conn.close()
 except Exception as e:
@@ -691,8 +722,15 @@ def _find_projects_by_path(pdb, conn, path: str):
     return matches
 
 
-def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
+def archive_hermes_project(path: str, profile_home: Path | None = None,
+                           project_id: str | None = None) -> dict:
     """Archive the projects.db project owning ``path`` (if any).
+
+    ``project_id`` (re-gate round 3 must-fix 2): when the picker row carried
+    an explicit native identity, archive EXACTLY that project. A stale or
+    replayed request whose project is already gone is not-found — it must
+    never select a successor project that later appeared at the same path
+    spelling. Without an id the path-owner lookup is unchanged.
 
     Fail-safe by contract, mirroring the read bridge: any error (no DB, no
     hermes_cli, subprocess failure) yields ``{"archived": False, ...}`` and
@@ -718,7 +756,16 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
                 # our write. The UPDATE is inlined (same statement as
                 # pdb.archive_project) because write_txn cannot nest.
                 with pdb.write_txn(conn):
-                    matches = _find_projects_by_path(pdb, conn, resolved)
+                    if project_id:
+                        row = conn.execute(
+                            "SELECT id FROM projects WHERE id = ? AND archived = 0",
+                            (str(project_id),),
+                        ).fetchone()
+                        if row is None:
+                            return {"archived": False, "reason": "not-found"}
+                        matches = [row[0]]
+                    else:
+                        matches = _find_projects_by_path(pdb, conn, resolved)
                     if not matches:
                         return {"archived": False, "reason": "not-found"}
                     if len(matches) > 1:
@@ -729,11 +776,12 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
                         return {"archived": False, "reason": "ambiguous-path",
                                 "count": len(matches)}
                     proj = matches[0]
+                    pid = proj.id if hasattr(proj, "id") else proj
                     n = conn.execute(
-                        "UPDATE projects SET archived = 1 WHERE id = ?", (proj.id,)
+                        "UPDATE projects SET archived = 1 WHERE id = ?", (pid,)
                     ).rowcount
                 _invalidate_cache(db)
-                return {"archived": bool(n), "id": proj.id}
+                return {"archived": bool(n), "id": pid}
             finally:
                 with contextlib.suppress(Exception):
                     conn.close()
@@ -748,7 +796,8 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
     import subprocess
     try:
         proc = subprocess.run(
-            [sys.executable, "-I", "-c", _ARCHIVE_PROJECT_PROG, str(db), resolved, str(agent_dir)],
+            [sys.executable, "-I", "-c", _ARCHIVE_PROJECT_PROG, str(db),
+             "id" if project_id else "path", str(project_id or resolved), str(agent_dir)],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -778,7 +827,7 @@ def archive_hermes_project(path: str, profile_home: Path | None = None) -> dict:
 
 _RENAME_PROJECT_PROG = """
 import json, os, sys
-db_path, path, name, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+db_path, match_mode, match_value, name, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 sys.path.insert(0, agent_dir)
 def _key(p):
     try:
@@ -793,13 +842,21 @@ try:
         # BEGIN IMMEDIATE spans lookup + ambiguity check + mutation
         # (re-gate must-fix 3; mirrors the in-process implementation).
         conn.execute("BEGIN IMMEDIATE")
-        key = _key(path)
-        matches = []
-        for p_ in pdb.list_projects(conn, include_archived=False):
-            primary = p_.primary_path or next(
-                (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
-            if primary and _key(primary) == key:
-                matches.append(p_)
+        if match_mode == "id":
+            # Explicit native identity — see the archive program (round 3).
+            row = conn.execute(
+                "SELECT id FROM projects WHERE id = ? AND archived = 0", (match_value,)
+            ).fetchone()
+            matches = [row[0]] if row else []
+        else:
+            key = _key(match_value)
+            matches = []
+            for p_ in pdb.list_projects(conn, include_archived=False):
+                primary = p_.primary_path or next(
+                    (f.path for f in p_.folders if f.is_primary), p_.folders[0].path if p_.folders else None)
+                if primary and _key(primary) == key:
+                    matches.append(p_)
+            matches = [m.id for m in matches]
         if not matches:
             conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "renamed": False, "reason": "not-found"}))
@@ -807,9 +864,9 @@ try:
             conn.execute("ROLLBACK")
             print(json.dumps({"ok": True, "renamed": False, "reason": "ambiguous-path", "count": len(matches)}))
         else:
-            ok = conn.execute("UPDATE projects SET name = ? WHERE id = ?", (name, matches[0].id)).rowcount
+            ok = conn.execute("UPDATE projects SET name = ? WHERE id = ?", (name, matches[0])).rowcount
             conn.execute("COMMIT")
-            print(json.dumps({"ok": True, "renamed": bool(ok), "id": matches[0].id}))
+            print(json.dumps({"ok": True, "renamed": bool(ok), "id": matches[0]}))
     finally:
         conn.close()
 except Exception as e:
@@ -817,8 +874,13 @@ except Exception as e:
 """
 
 
-def rename_hermes_project(path: str, name: str, profile_home: Path | None = None) -> dict:
+def rename_hermes_project(path: str, name: str, profile_home: Path | None = None,
+                          project_id: str | None = None) -> dict:
     """Rename the projects.db project owning ``path`` (if any).
+
+    ``project_id``: explicit native identity — see archive_hermes_project
+    (round 3 must-fix 2); a stale/replayed request renames nothing rather
+    than a path-selected successor.
 
     Fail-safe by contract, mirroring archive: any error yields
     ``{"renamed": False, ...}`` and never raises — the local rename has
@@ -843,7 +905,16 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
                 # (re-gate must-fix 3). The UPDATE mirrors pdb.update_project's
                 # name branch because write_txn cannot nest.
                 with pdb.write_txn(conn):
-                    matches = _find_projects_by_path(pdb, conn, resolved)
+                    if project_id:
+                        row = conn.execute(
+                            "SELECT id FROM projects WHERE id = ? AND archived = 0",
+                            (str(project_id),),
+                        ).fetchone()
+                        if row is None:
+                            return {"renamed": False, "reason": "not-found"}
+                        matches = [row[0]]
+                    else:
+                        matches = _find_projects_by_path(pdb, conn, resolved)
                     if not matches:
                         return {"renamed": False, "reason": "not-found"}
                     if len(matches) > 1:
@@ -851,11 +922,12 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
                         return {"renamed": False, "reason": "ambiguous-path",
                                 "count": len(matches)}
                     proj = matches[0]
+                    pid = proj.id if hasattr(proj, "id") else proj
                     n = conn.execute(
-                        "UPDATE projects SET name = ? WHERE id = ?", (name, proj.id)
+                        "UPDATE projects SET name = ? WHERE id = ?", (name, pid)
                     ).rowcount
                 _invalidate_cache(db)
-                return {"renamed": bool(n), "id": proj.id}
+                return {"renamed": bool(n), "id": pid}
             finally:
                 with contextlib.suppress(Exception):
                     conn.close()
@@ -868,7 +940,8 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     import subprocess
     try:
         proc = subprocess.run(
-            [sys.executable, "-I", "-c", _RENAME_PROJECT_PROG, str(db), resolved, name, str(agent_dir)],
+            [sys.executable, "-I", "-c", _RENAME_PROJECT_PROG, str(db),
+             "id" if project_id else "path", str(project_id or resolved), name, str(agent_dir)],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
