@@ -33,7 +33,9 @@ def _manager_available() -> bool:
     return _projects_db_module() is not None or _agent_dir() is not None
 
 
-requires_manager = pytest.mark.usefixtures("_requires_manager")
+def requires_manager(fn):
+    fn = pytest.mark.usefixtures("_requires_manager")(fn)
+    return pytest.mark.projects_manager(fn)
 
 
 @pytest.fixture
@@ -292,3 +294,87 @@ def test_reorder_db_only_project_under_remote_cwd_persists(remote_alias_scenario
     rows = [w for w in state["wss"] if w["path"] == s["real_str"]]
     assert len(rows) == 1 and rows[0].get("project_mirror"), \
         f"dragged DB-only row must materialize with mirror provenance: {state['wss']}"
+
+
+# ── OCR high (bundle 1): the "remote literal always has a saved local row"
+# invariant is not enforced upstream — _clean_workspace_list can filter the
+# alias row (e.g. remote cwd momentarily inaccessible). With NO local row,
+# DB ownership must be LEXICAL: the DB naming `real` does not make the
+# alias spelling native, or remove/rename cross onto the host project
+# through the symlink coincidence again.
+
+
+@requires_manager
+def test_remove_dropped_alias_row_does_not_archive_host_project(remote_alias_scenario):
+    from api.routes import _handle_workspace_remove
+
+    s = remote_alias_scenario
+    state = {"wss": []}  # alias row filtered from workspaces.json
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_remove(handler, {"path": s["alias_str"]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert _db_state(s["db"])["archived"] == 0, \
+        "a remote-spelled path the DB does not name lexically must never archive the realpath-coinciding host project"
+
+
+@requires_manager
+def test_rename_dropped_alias_row_does_not_rename_host_project(remote_alias_scenario):
+    from api.routes import _handle_workspace_rename
+
+    s = remote_alias_scenario
+    state = {"wss": []}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_rename(handler, {"path": s["alias_str"], "name": "Hijack"})
+    code = handler.send_response.call_args[0][0]
+    assert code == 404, f"remote spelling with no local row and no lexical DB owner must 404, got {code}: {_response(handler)}"
+    assert _db_state(s["db"])["name"] == "HostProj", \
+        "renaming a dropped remote alias row must not rename the host project"
+
+
+@requires_manager
+def test_reorder_dropped_alias_row_not_materialized_from_host(remote_alias_scenario):
+    from api.routes import _handle_workspace_reorder
+
+    s = remote_alias_scenario
+    state = {"wss": []}
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_reorder(handler, {"paths": [s["alias_str"]]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert not any(w.get("project_mirror") for w in state["wss"]), \
+        f"a remote spelling the DB does not name lexically must not materialize the host row: {state['wss']}"
+
+
+# ── omp P2: spelling equality (no symlink). The host has a PLAIN directory
+# at the identical spelling the DB owns (e.g. /srv/www on both sides). The
+# remote literal must keep its own label in the merged projection — a name
+# override makes rename/remove appear to no-op because the DB name
+# re-asserts on every poll — and the DB entry must not double-list.
+
+
+@requires_manager
+def test_merge_remote_literal_equal_spelling_keeps_remote_label(tmp_path, monkeypatch):
+    from api.projects_bridge import merge_hermes_projects
+
+    same = tmp_path / "srv" / "www"
+    same.mkdir(parents=True)
+    monkeypatch.setattr("api.workspace._remote_terminal_cwd",
+                        lambda profile=None: str(tmp_path / "srv"))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    _make_projects_db(home, [
+        {"id": "p1", "slug": "hostproj", "name": "HostProj", "folders": [str(same)]},
+    ])
+    wss = [{"path": str(same), "name": "RemoteWWW"}]
+    merged = merge_hermes_projects(wss, profile="default")
+    rows = [w for w in merged if w["path"] == str(same)]
+    assert len(rows) == 1, f"DB entry must dedupe against the remote row: {merged}"
+    assert rows[0]["name"] == "RemoteWWW", \
+        f"remote literal label must survive a spelling-equality DB hit: {merged}"

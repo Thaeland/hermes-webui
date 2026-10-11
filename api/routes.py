@@ -28365,6 +28365,7 @@ def _handle_workspace_create_project(handler, body):
     # row — provenance, not name-matching, is the hiding trigger (re-gate
     # must-fix 1).
     from api.projects_bridge import merge_hermes_projects, path_key as _path_key
+    registered = "error" not in project
     try:
         wss = load_workspaces(profile=active_profile)
     except TypeError:
@@ -28373,12 +28374,19 @@ def _handle_workspace_create_project(handler, body):
     existing_row = next(
         (w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == new_key), None)
     if existing_row is None:
-        wss.append({"path": str(p), "name": project_name, "project_mirror": True})
+        # OCR medium: only stamp mirror provenance when the DB registration
+        # actually succeeded — a rejected registration (e.g. path owned by an
+        # ARCHIVED project) must not produce a mirror row that the merge then
+        # hides, recreating the invisible-row class of must-fix 1.
+        row = {"path": str(p), "name": project_name}
+        if registered:
+            row["project_mirror"] = True
+        wss.append(row)
         try:
             save_workspaces(wss, profile=active_profile)
         except TypeError:
             save_workspaces(wss)
-    elif not existing_row.get("project_mirror"):
+    elif registered and not existing_row.get("project_mirror"):
         # Plain local row promoted to a shared project: stamp provenance on
         # the existing row too, or a later archive leaves an un-hidable
         # mirror (deep-audit finding 1).
@@ -28439,23 +28447,32 @@ def _handle_workspace_remove(handler, body):
         db_paths = {_path_key(e["path"]) for e in _entries if e.get("path")}
     except Exception:
         db_paths = set()
-    # Re-gate must-fix (remote-to-host identity) + greptile P1: identity is
-    # carried by the entry's ORIGIN, not by the path string alone. A SAVED
-    # local row without mirror provenance under the remote cwd is a REMOTE
-    # literal — its host realpath coincidence (host symlink `alias -> real`
-    # + native project at `real`) must not archive the host project. A path
-    # with NO local row is a picker row that came FROM projects.db itself
-    # (Desktop/CLI-created), which is host-native even when its spelling
-    # falls under a remote terminal.cwd — blocking it would make shared
-    # projects unrenamable/undeletable from the picker (greptile P1).
-    # Provenance is the only bridge either way: a persisted mirror row was
-    # created FROM the shared store (deep-audit 2b).
+    # Re-gate must-fix (remote-to-host identity) + greptile P1 + OCR high:
+    # identity is carried by the entry's ORIGIN, not the path string alone.
+    # A SAVED local row without mirror provenance under the remote cwd is a
+    # REMOTE literal — its host realpath coincidence (host symlink
+    # `alias -> real` + native project at `real`) must not archive the host
+    # project. A path with NO local row is a picker row that came FROM
+    # projects.db itself (Desktop/CLI-created) — but ONLY if the DB owns the
+    # SPELLING lexically (that verbatim string is how the row reached the
+    # picker). Ownership through the host realpath alone is a symlink
+    # coincidence, never provenance: a remote-spelled path the DB does not
+    # name lexically stays a remote literal even when its row was dropped or
+    # filtered from workspaces.json (OCR high). Blocking lexically-owned DB
+    # rows would make shared projects unrenamable/undeletable from the
+    # picker (greptile P1). A persisted mirror row was created FROM the
+    # shared store (deep-audit 2b).
+    from api.projects_bridge import lexical_key
+    remote_spelled = is_remote_workspace_path(path_str, profile=active_profile)
+    try:
+        db_lexical = {lexical_key(e["path"]) for e in _entries if e.get("path")}
+    except Exception:
+        db_lexical = set()
     local_row = next((w for w in wss if _same_path(w.get("path", ""), path_str)), None)
-    remote_literal = (
-        local_row is not None
-        and not local_row.get("project_mirror")
-        and is_remote_workspace_path(path_str, profile=active_profile)
-    )
+    if local_row is not None:
+        remote_literal = remote_spelled and not local_row.get("project_mirror")
+    else:
+        remote_literal = remote_spelled and lexical_key(path_str) not in db_lexical
     shared_backed = host_path in db_paths and not remote_literal
     if shared_backed:
         result = archive_hermes_project(host_path)
@@ -28524,7 +28541,7 @@ def _handle_workspace_rename(handler, body):
         # a path no project owns is a 404 even when the writer is
         # unreachable — a 500 here misreports "workspace not found" as a
         # server fault (re-gate low).
-        from api.projects_bridge import load_project_state, merge_hermes_projects, rename_hermes_project
+        from api.projects_bridge import lexical_key, load_project_state, merge_hermes_projects, rename_hermes_project
         _entries, _archived, read_ok = load_project_state()
         if not read_ok:
             return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.", 500)
@@ -28532,6 +28549,7 @@ def _handle_workspace_rename(handler, body):
             _db_keys = {_path_key(e["path"]) for e in _entries if e.get("path")}
         except Exception:
             _db_keys = set()
+        from api.projects_bridge import is_remote_workspace_path
         if _path_key(path_str) not in _db_keys:
             # Host key: projects.db is host-local (deep-audit 2b). Reaching
             # this branch means NO local row matched, so the picker row came
@@ -28541,6 +28559,19 @@ def _handle_workspace_rename(handler, body):
             # unrenamable). A remote literal always has a saved local row;
             # that lane is gated in the local-row branch below.
             return bad(handler, "Workspace not found", 404)
+        if is_remote_workspace_path(path_str, profile=active_profile):
+            # OCR high: no local row + remote spelling — the host-key check
+            # above can pass purely through a symlink coincidence (host
+            # symlink `alias -> real`, DB owns `real`). The DB must name the
+            # SPELLING lexically to prove this row came from it; otherwise
+            # this is a remote literal whose row was dropped/filtered, and
+            # renaming through the coincidence would rename the host project.
+            try:
+                _db_lexical = {lexical_key(e["path"]) for e in _entries if e.get("path")}
+            except Exception:
+                _db_lexical = set()
+            if lexical_key(path_str) not in _db_lexical:
+                return bad(handler, "Workspace not found", 404)
         result = rename_hermes_project(path_str, name)
         if not result.get("renamed"):
             if result.get("reason") in ("not-found", "no-db", "disabled"):
@@ -28567,7 +28598,7 @@ def _handle_workspace_rename(handler, body):
     # rename must not commit a local name the next GET would revert
     # (re-gate finding 2). A failed ownership read is unknown, not proof
     # of local-only (greptile P1): fail closed.
-    from api.projects_bridge import load_project_state, merge_hermes_projects, path_key as _path_key, rename_hermes_project
+    from api.projects_bridge import lexical_key, load_project_state, merge_hermes_projects, path_key as _path_key, rename_hermes_project
     host_path = _path_key(path_str)
     _entries, _archived, read_ok = load_project_state()
     if not read_ok:
@@ -28577,17 +28608,25 @@ def _handle_workspace_rename(handler, body):
     except Exception:
         db_paths = set()
     from api.projects_bridge import is_remote_workspace_path
-    # Re-gate must-fix (remote-to-host identity) + greptile P1: same origin
-    # rule as remove — a SAVED local row without mirror provenance under the
-    # remote cwd renames its own label locally, never the native project its
-    # host realpath happens to point at. A mirror row was created FROM the
-    # shared store, so it renames there (deep-audit 2b).
+    # Re-gate must-fix (remote-to-host identity) + greptile P1 + OCR high:
+    # same origin rule as remove. A SAVED local row without mirror
+    # provenance under the remote cwd renames its own label locally, never
+    # the native project its host realpath happens to point at. A mirror
+    # row was created FROM the shared store, so it renames there
+    # (deep-audit 2b). With NO local row, DB ownership must be LEXICAL —
+    # the DB naming this exact spelling is how the row reached the picker;
+    # ownership only through the host realpath is a symlink coincidence
+    # and a remote-spelled path stays a remote literal.
+    remote_spelled = is_remote_workspace_path(path_str, profile=active_profile)
+    try:
+        _db_lexical = {lexical_key(e["path"]) for e in _entries if e.get("path")}
+    except Exception:
+        _db_lexical = set()
     local_row = next((w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == target_key), None)
-    remote_literal = (
-        local_row is not None
-        and not local_row.get("project_mirror")
-        and is_remote_workspace_path(path_str, profile=active_profile)
-    )
+    if local_row is not None:
+        remote_literal = remote_spelled and not local_row.get("project_mirror")
+    else:
+        remote_literal = remote_spelled and lexical_key(path_str) not in _db_lexical
     shared_backed = host_path in db_paths and not remote_literal
     if shared_backed:
         result = rename_hermes_project(host_path, name)
@@ -28673,8 +28712,19 @@ def _handle_workspace_reorder(handler, body):
             # No local row: the dragged picker row came FROM projects.db
             # (Desktop/CLI-created), a native entry even when its spelling
             # falls under a remote terminal.cwd — its dragged position must
-            # persist (greptile P1). A remote literal always has a saved
-            # local row and is handled by the local_hit branch above.
+            # persist (greptile P1). But for a REMOTE spelling, ownership
+            # through the host key alone can be a pure symlink coincidence
+            # (host symlink `alias -> real`, DB owns `real`): the DB must
+            # name the spelling lexically, or the drag would materialize the
+            # unrelated host project's row over the remote alias (OCR high).
+            from api.projects_bridge import is_remote_workspace_path, lexical_key
+            if is_remote_workspace_path(p, profile=active_profile):
+                try:
+                    _db_lexical = {lexical_key(e["path"]) for e in load_hermes_project_workspaces()}
+                except Exception:
+                    _db_lexical = set()
+                if lexical_key(p) not in _db_lexical:
+                    continue
             entry = db_by_path.get(host_key) or db_by_path[key]
             # Materialized from the shared store -> mirror provenance, so a
             # later archive hides exactly this row (must-fix 1 contract).

@@ -154,6 +154,13 @@ def path_key(path: str | Path, profile: str | Path | None = None) -> str:
         return _lexical_key(s)
 
 
+def lexical_key(path: str | Path) -> str:
+    """Public lexical (filesystem-free) canonical key: normcase + abspath +
+    expanduser, no symlink resolution. Used to prove a projects.db entry
+    owns a path's SPELLING itself rather than only its symlink target."""
+    return _lexical_key(str(path))
+
+
 def _projects_db_path(profile_home: Path | None) -> Path | None:
     """Resolve ``projects.db`` for a profile home (None = ambient active profile)."""
     try:
@@ -365,8 +372,21 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
             continue
         hit = db_by_path.get(key)
         if hit is not None:
-            entry["name"] = hit["name"]
-            entry["source"] = "hermes_project"
+            # A remote literal can only hit lexically when the DB names the
+            # IDENTICAL spelling (no symlink — e.g. /srv/www exists on both
+            # host and target and the DB owns it). Overriding the label there
+            # makes the remote workspace unmanageable (rename/remove appear
+            # to no-op because the DB name re-asserts every poll), so the
+            # remote label wins; the row still dedupes the DB entry to keep
+            # one picker row, and after the local row is removed the DB
+            # project re-appends under its own name (omp P2).
+            if not (
+                profile is not None
+                and not entry.get("project_mirror")
+                and _is_remote_workspace_path(str(path), profile=profile)
+            ):
+                entry["name"] = hit["name"]
+                entry["source"] = "hermes_project"
             used.add(key)
         merged.append(entry)
     for e in db_entries:
