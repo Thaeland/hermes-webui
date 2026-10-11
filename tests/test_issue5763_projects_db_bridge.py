@@ -68,7 +68,9 @@ def _manager_available() -> bool:
     return _projects_db_module() is not None or _agent_dir() is not None
 
 
-requires_manager = pytest.mark.usefixtures("_requires_manager")
+def requires_manager(fn):
+    fn = pytest.mark.usefixtures("_requires_manager")(fn)
+    return pytest.mark.projects_manager(fn)
 
 
 @pytest.fixture
