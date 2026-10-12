@@ -342,6 +342,16 @@ def _stamp_remote_kind(w: dict, profile: str | Path | None) -> dict:
 
 
 def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = None, profile: str | Path | None = None) -> list[dict]:
+    # One call-scoped memo for the per-row probes below (remote cwd config
+    # read + blocked-root tables): the merge asks "is this row remote?" for
+    # every picker row with the SAME profile argument. Fresh memo per merge
+    # call — see workspace_call_scope for why it is never process-lifetime.
+    from api.workspace import workspace_call_scope
+    with workspace_call_scope():
+        return _merge_hermes_projects_inner(workspaces, profile_home=profile_home, profile=profile)
+
+
+def _merge_hermes_projects_inner(workspaces: list[dict], profile_home: Path | None = None, profile: str | Path | None = None) -> list[dict]:
     """Merge projects.db entries into a WebUI workspace list.
 
     - projects.db is authoritative for a path it owns: a local entry with the

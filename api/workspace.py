@@ -271,6 +271,56 @@ def profile_home_resolve_cache_scope():
         _PROFILE_HOME_RESOLVE_SCOPE.reset(token)
 
 
+# Call-scoped memo for the per-row remoteness/blocked-root probes (#5763
+# re-gate round 8 perf finding): GET /api/workspaces merges projects.db
+# into the picker and every row asks "is this path remote?" — each ask re-read
+# the profile config.yaml (``_remote_terminal_cwd``) and rebuilds the
+# blocked-roots tables with ~45 ``Path.resolve()`` calls. On SSH/Docker
+# profiles that compounded GET /api/workspaces to 2-4x master latency even
+# with the sync kill switch off. Same rule as the scope above (PR #7636
+# lesson): memo lives for exactly ONE hot-loop invocation, never the process
+# — a retargeted symlink or an edited config.yaml must be visible to the
+# next request.
+_WORKSPACE_CALL_SCOPE: "contextvars.ContextVar[dict | None]" = (
+    contextvars.ContextVar("_WORKSPACE_CALL_SCOPE", default=None)
+)
+
+
+@contextlib.contextmanager
+def workspace_call_scope():
+    """Enable the call-scoped memo for one hot-loop invocation.
+
+    Wrap a loop that repeats the same profile-level probes (remote terminal
+    cwd, blocked system roots) over many rows — currently
+    ``projects_bridge.merge_hermes_projects``. Outside the scope every probe
+    runs fresh, exactly like pre-scope behavior. Nested use restores the
+    outer memo on exit.
+    """
+    token = _WORKSPACE_CALL_SCOPE.set({})
+    try:
+        yield
+    finally:
+        _WORKSPACE_CALL_SCOPE.reset(token)
+
+
+def _call_scoped_memo(key, thunk):
+    """Run ``thunk`` once per active ``workspace_call_scope()``; fresh outside.
+
+    The thunk is invoked lazily and its result cached per ``key`` only while
+    a scope is active, so patched/monkeypatched call targets still see one
+    call per scope instead of one per row.
+    """
+    cache = _WORKSPACE_CALL_SCOPE.get()
+    if cache is None:
+        return thunk()
+    sentinel = object()
+    value = cache.get(key, sentinel)
+    if value is sentinel:
+        value = thunk()
+        cache[key] = value
+    return value
+
+
 def _cached_safe_resolve_profile_home(pre_resolve: Path) -> Path:
     """`_safe_resolve()` for profile-home paths.
 
@@ -379,7 +429,11 @@ def _remote_terminal_workspace_candidate(path: str | Path, profile: str | Path |
     such as macOS synthetic ``/home`` -> ``/System/Volumes/Data/home``).
     """
     try:
-        cwd = _remote_terminal_cwd(profile=profile) if profile is not None else _remote_terminal_cwd()
+        cwd = _call_scoped_memo(
+            ("remote_cwd", str(profile)),
+            lambda: (_remote_terminal_cwd(profile=profile) if profile is not None
+                     else _remote_terminal_cwd()),
+        )
     except TypeError:
         cwd = _remote_terminal_cwd()
     if not cwd:
@@ -913,8 +967,8 @@ def _is_blocked_workspace_path(candidate: Path, raw_path: str | Path | None = No
     if _is_blocked_posix_workspace_path(posix_probe):
         return True
 
-    exact = _workspace_blocked_exact_roots()
-    if candidate in exact or (raw is not None and raw in _workspace_blocked_roots()):
+    exact = _call_scoped_memo("blocked_exact_roots", _workspace_blocked_exact_roots)
+    if candidate in exact or (raw is not None and raw in _call_scoped_memo("blocked_roots", _workspace_blocked_roots)):
         return True
 
     for tmp in _USER_TMP_PREFIXES:
@@ -923,7 +977,7 @@ def _is_blocked_workspace_path(candidate: Path, raw_path: str | Path | None = No
 
     # Raw paths under literal roots (e.g. /etc/ssh, /var/db) are always blocked.
     if raw is not None:
-        for blocked in _workspace_blocked_roots():
+        for blocked in _call_scoped_memo("blocked_roots", _workspace_blocked_roots):
             if _is_within(raw, blocked):
                 return True
 
@@ -932,7 +986,8 @@ def _is_blocked_workspace_path(candidate: Path, raw_path: str | Path | None = No
     # and per-user temporary workspaces; other direct /private/var system data
     # such as /private/var/db and /private/var/log remains blocked.
     allowed_private_var = (Path('/private/var/folders'), Path('/private/var/tmp'))
-    for blocked in _workspace_blocked_resolved_subtrees():
+    for blocked in _call_scoped_memo("blocked_resolved_subtrees",
+                                     _workspace_blocked_resolved_subtrees):
         if blocked == Path('/private/var'):
             if candidate == blocked:
                 return True
