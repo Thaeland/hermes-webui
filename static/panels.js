@@ -6469,17 +6469,20 @@ async function saveWorkspaceForm(){
       if(target.workspace_kind) body.workspace_kind=target.workspace_kind;
       if(target.project_id) body.project_id=target.project_id;
       await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify(body) });
-      // Refresh list and re-render detail
       const data = await api('/api/workspaces');
       _workspaceList = data.workspaces || [];
       _workspacePreFormDetail = null;
       showToast(t('workspace_renamed') || t('workspace_added'));
       renderWorkspacesPanel(_workspaceList);
-      // Re-open by identity, not path alone (round 3: two rows may share a
-      // spelling; the renamed one is the one carrying this kind/project_id).
-      openWorkspaceDetail({path: targetPath,
-        workspace_kind: target.workspace_kind,
-        project_id: target.project_id});
+      const still = _currentWorkspaceDetail
+        && _currentWorkspaceDetail.path === target.path
+        && (_currentWorkspaceDetail.workspace_kind||'') === target.workspace_kind
+        && (_currentWorkspaceDetail.project_id||'') === target.project_id;
+      if (still) {
+        openWorkspaceDetail({path: targetPath,
+          workspace_kind: target.workspace_kind,
+          project_id: target.project_id});
+      }
       return;
     }
     const asProjectEl = $('workspaceFormAsProject');

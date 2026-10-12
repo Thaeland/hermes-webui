@@ -228,28 +228,42 @@ def test_remove_stale_predecessor_keeps_successor_row_order_and_provenance(host_
     assert _db_row(db, "B")["archived"] == 0
 
 
-def test_remove_retired_id_replay_cleans_only_its_mirror(host_scenario, monkeypatch):
-    # Route-level contract: the bridge refuses the id (not-found);
-    # stubbed so this runs in CI without an agent checkout.
+def test_remove_retired_id_replay_does_not_save(host_scenario, monkeypatch):
+    """Refused id → zero local save (re-gate 05:31). Mirror-flag cleanup is
+    not same-owner proof, so even a retired-A replay must not mutate."""
     _bridge_refuses_id(monkeypatch)
-    """Idempotent replay: A retired, nothing active owns P -> only the mirror
-    row is cleaned up; a plain local row at P is never dropped on a refusal."""
     from api.routes import _handle_workspace_remove
 
     s = host_scenario
     _make_projects_db(s["home"], [
         {"id": "A", "slug": "a", "name": "A", "folders": [s["p"]], "archived": 1},
     ])
-    store = _Store([{"path": s["p"], "name": "A", "project_mirror": True},
-                    {"path": s["other"], "name": "Other"}])
+    rows = [{"path": s["p"], "name": "A", "project_mirror": True},
+            {"path": s["other"], "name": "Other"}]
+    store = _Store(rows)
     h = _call(_handle_workspace_remove, {"path": s["p"], "project_id": "A"}, store)
-    assert _code(h) == 200, _response(h)
-    assert store.rows == [{"path": s["other"], "name": "Other"}]
+    assert _code(h) == 404, _response(h)
+    assert store.saves == 0 and store.rows == rows
 
     store = _Store([{"path": s["p"], "name": "Mine"}])
     h = _call(_handle_workspace_remove, {"path": s["p"], "project_id": "A"}, store)
-    assert _code(h) == 200, _response(h)
-    assert store.rows == [{"path": s["p"], "name": "Mine"}], "plain local row must survive"
+    assert _code(h) == 404, _response(h)
+    assert store.saves == 0 and store.rows == [{"path": s["p"], "name": "Mine"}]
+
+
+def test_remove_unknown_id_does_not_drop_unrelated_mirror(host_scenario, monkeypatch):
+    _bridge_refuses_id(monkeypatch)
+    from api.routes import _handle_workspace_remove
+
+    s = host_scenario
+    _make_projects_db(s["home"], [])
+    rows = [{"path": s["p"], "name": "B", "project_mirror": True},
+            {"path": s["other"], "name": "Other"}]
+    store = _Store(rows)
+    h = _call(_handle_workspace_remove, {"path": s["p"], "project_id": "NOPE"}, store)
+    assert _code(h) == 404, _response(h)
+    assert store.saves == 0 and store.rows == rows, \
+        f"unknown id must not drop B's saved mirror: {store.rows}"
 
 
 # ── 2. Blocker 2: native-producer projects through the subprocess lane ──
@@ -496,14 +510,20 @@ def test_frontend_delete_and_rename_keep_invocation_identity():
           pendingApi[0].d.resolve({workspaces: []}); await run2;
           assert.strictEqual(cleared, 1);
           // rename: selection changes while the rename request is pending
-          pendingApi = []; _currentWorkspaceDetail = B;
+          pendingApi = []; opened = null; _currentWorkspaceDetail = B;
           const run3 = saveWorkspaceForm(); await tick();
           assert.deepStrictEqual(pendingApi[0].body, {path: '/srv/www', name: 'New Name', project_id: 'N1'});
           _currentWorkspaceDetail = A;
           pendingApi[0].d.resolve({ok: true}); await tick();
-          pendingApi[1].d.resolve({workspaces: []}); await run3;
+          pendingApi[1].d.resolve({workspaces: [A, B]}); await run3;
+          assert.strictEqual(opened, null, 'must not reopen the renamed row over the newly selected one');
+          // same-selection positive: still on B → reopen B
+          pendingApi = []; opened = null; _currentWorkspaceDetail = B; _workspaceMode = 'edit';
+          const run4 = saveWorkspaceForm(); await tick();
+          pendingApi[0].d.resolve({ok: true}); await tick();
+          pendingApi[1].d.resolve({workspaces: [A, B]}); await run4;
           assert.deepStrictEqual(opened, {path: '/srv/www', workspace_kind: '', project_id: 'N1'},
-            're-open must target the renamed row, not the newly selected one');
+            'same selection must still reopen the renamed row');
         })().catch((err) => { console.error(err && err.stack || err); process.exit(1); });
     """).replace("__FNS__", fns)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)

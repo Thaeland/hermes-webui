@@ -30313,22 +30313,11 @@ def _handle_workspace_remove(handler, body):
                     "workspace left unchanged.",
                 )
             if not result.get("archived"):
-                # Refused or stale id (round 7, re-gate blocker 1): the bridge
-                # rejected the (path, project_id) pair, so local cleanup must be
-                # PROVEN to belong to that retired owner — otherwise a wrong-id
-                # or stale-predecessor request would delete an unrelated saved
-                # row (or a successor's row/order) by path. Zero mutation when
-                # the id is still active elsewhere (mismatched pair) or any
-                # active project owns this path (successor). Only when the id is
-                # gone AND nothing active owns the path is the request an
-                # idempotent replay, and then only mirror rows (rows created FROM
-                # the shared store, hidden once their project retired) are
-                # cleaned up — plain local rows are never dropped on a refusal.
-                id_active = any(str(e.get("project_id") or "") == req_project_id
-                                for e in _entries)
-                if id_active or host_path in db_paths:
-                    return bad(handler, "Workspace not found", 404)
-                return _remove_local_and_respond(drop_mirror="mirror-only")
+                # Refused or stale id (re-gate 05:31): a Boolean mirror flag is
+                # not same-owner proof. Unknown id, retired A-at-Q, and
+                # folderless A all used to drop unrelated B-at-P mirrors.
+                # Zero local save; idempotent replay is 404, same as a mismatch.
+                return bad(handler, "Workspace not found", 404)
             return _remove_local_and_respond(drop_mirror=True)
 
         if local_row is None and remote_spelled:
