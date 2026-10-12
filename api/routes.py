@@ -31954,12 +31954,31 @@ def _handle_workspace_add(handler, body):
         except Exception:
             merged_now = wss
         new_key = _path_key(str(p), profile=active_profile)
-        if any(_path_key(w.get("path", ""), profile=active_profile) == new_key for w in merged_now):
+        # Duplicates are judged per TARGET KIND, not by path alone (round 7,
+        # re-gate lifecycle gap): a remote workspace and a native/local target
+        # may share one spelling and are independent rows (round 3). A new
+        # remote row conflicts only with an existing remote literal; a new
+        # local row only with native/local rows at the key.
+        from api.projects_bridge import is_remote_workspace_path as _is_remote_ws
+
+        def _is_remote_row(w):
+            if w.get("workspace_kind") == "remote":
+                return True
+            if w.get("project_mirror") or w.get("source") == "hermes_project":
+                return False
+            return _is_remote_ws(str(w.get("path", "")), profile=active_profile)
+
+        new_is_remote = _is_remote_ws(str(p), profile=active_profile)
+        if any(_path_key(w.get("path", ""), profile=active_profile) == new_key
+               and _is_remote_row(w) == new_is_remote for w in merged_now):
             return bad(handler, "Workspace already in list")
-        # Any local row at this key that the merge hides (retired mirror) is
-        # replaced by the new plain row — never keep a hidden row plus a visible
-        # one for the same directory.
-        wss = [w for w in wss if _path_key(w.get("path", ""), profile=active_profile) != new_key]
+        # Any local row of the SAME kind at this key that the merge hides
+        # (retired mirror) is replaced by the new plain row — never keep a hidden
+        # row plus a visible one for the same target. A same-spelling row of the
+        # other kind is an independent target and survives.
+        wss = [w for w in wss
+               if not (_path_key(w.get("path", ""), profile=active_profile) == new_key
+                       and _is_remote_row(w) == new_is_remote)]
         wss.append({"path": str(p), "name": name or p.name})
         try:
             save_workspaces(wss, profile=active_profile)
@@ -32167,7 +32186,8 @@ def _handle_workspace_remove(handler, body):
 
         def _remove_local_and_respond(drop_mirror=None):
             # drop_mirror=None: legacy — drop every row at the spelling (old
-            # behavior). True/False: identity lanes drop ONLY the row matching
+            # behavior). "mirror-only": idempotent cleanup after a refused id —
+            # mirror rows only (round 7). True/False: identity lanes drop ONLY the row matching
             # that provenance, so a same-spelling sibling row survives (round 3).
             # True additionally drops a PLAIN local row that is not a remote
             # literal: a folder added locally first and registered in
@@ -32183,6 +32203,8 @@ def _handle_workspace_remove(handler, body):
                     return False
                 if drop_mirror is None:
                     return True
+                if drop_mirror == "mirror-only":
+                    return bool(w.get("project_mirror"))
                 if drop_mirror is True:
                     return (bool(w.get("project_mirror"))
                             or not is_remote_workspace_path(str(w.get("path", "")),
@@ -32221,6 +32243,23 @@ def _handle_workspace_remove(handler, body):
                     "Could not archive the shared Hermes Project (projects writer unavailable); "
                     "workspace left unchanged.",
                 )
+            if not result.get("archived"):
+                # Refused or stale id (round 7, re-gate blocker 1): the bridge
+                # rejected the (path, project_id) pair, so local cleanup must be
+                # PROVEN to belong to that retired owner — otherwise a wrong-id
+                # or stale-predecessor request would delete an unrelated saved
+                # row (or a successor's row/order) by path. Zero mutation when
+                # the id is still active elsewhere (mismatched pair) or any
+                # active project owns this path (successor). Only when the id is
+                # gone AND nothing active owns the path is the request an
+                # idempotent replay, and then only mirror rows (rows created FROM
+                # the shared store, hidden once their project retired) are
+                # cleaned up — plain local rows are never dropped on a refusal.
+                id_active = any(str(e.get("project_id") or "") == req_project_id
+                                for e in _entries)
+                if id_active or host_path in db_paths:
+                    return bad(handler, "Workspace not found", 404)
+                return _remove_local_and_respond(drop_mirror="mirror-only")
             return _remove_local_and_respond(drop_mirror=True)
 
         if local_row is None and remote_spelled:
@@ -32521,14 +32560,17 @@ def _handle_workspace_reorder(handler, body):
             path_key as _path_key,
         )
         db_by_path = {}
+        active_ids: set | None = None  # None = DB unreadable -> cannot validate ids
         try:
             # First-wins per path key — MUST match merge_hermes_projects'
             # db_by_path rule (round 3 audit F2): with two DB projects behind
             # one realpath (symlink spellings), the projection shows the FIRST
             # entry; a last-wins dict here made a drag materialize the OTHER
             # project than the row the user actually dragged.
-            for _e in load_hermes_project_workspaces():
+            _all_entries = load_hermes_project_workspaces()
+            for _e in _all_entries:
                 db_by_path.setdefault(_path_key(_e["path"]), _e)
+            active_ids = {str(_e.get("project_id") or "") for _e in _all_entries} - {""}
         except Exception:
             pass
         reordered = []
@@ -32607,6 +32649,11 @@ def _handle_workspace_reorder(handler, body):
                 seen.add(ident)
                 continue
             if item_project_id:
+                # Stale/unknown native id (round 7, re-gate lifecycle gap): never
+                # let it claim a local row's position — validate BEFORE the
+                # local-hit lookup. The row itself is preserved by the safety net.
+                if active_ids is not None and item_project_id not in active_ids:
+                    continue
                 # Native claim resolves to the row that IS this project: a
                 # persisted mirror, or a plain local row the projection merged
                 # with the DB entry (audit F3 — nulling that out flipped a

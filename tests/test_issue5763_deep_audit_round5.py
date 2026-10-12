@@ -20,6 +20,7 @@
    longer last-writer-wins a concurrent mutation.
 """
 import json
+import os
 import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -290,7 +291,7 @@ def test_save_workspaces_atomic_replace(tmp_path, monkeypatch):
     state_file = tmp_path / "workspaces.json"
     monkeypatch.setattr(ws, "_workspaces_file_for_profile", lambda profile=None: state_file)
     replaced: list = []
-    real_replace = __import__("os").replace
+    real_replace = os.replace
 
     def spy_replace(src, dst):
         replaced.append((Path(src), Path(dst)))
