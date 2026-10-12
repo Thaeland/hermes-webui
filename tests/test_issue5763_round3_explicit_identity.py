@@ -302,3 +302,50 @@ def test_reorder_stale_remote_claim_materializes_nothing(equal_spelling_scenario
     assert handler.send_response.call_args[0][0] == 200, _response(handler)
     assert state["wss"] == [], \
         f"a stale remote drag must not materialize the coinciding native row: {state['wss']}"
+
+
+# ── 5. Identity-scoped local mutation: sibling row at same spelling survives ─
+
+
+@requires_manager
+@BACKENDS
+def test_native_remove_identity_does_not_delete_sibling_remote_row(equal_spelling_scenario, backend):
+    from api.routes import _handle_workspace_remove
+
+    s = equal_spelling_scenario
+    _use_backend(s, backend)
+    # Both rows exist locally: saved remote row + materialized native mirror.
+    state = {"wss": [
+        {"path": s["same"], "name": "RemoteWWW"},
+        {"path": s["same"], "name": "HostProj", "project_mirror": True},
+    ]}
+    h = _make_handler()
+    with _state_store(state)[0], _state_store(state)[1]:
+        _handle_workspace_remove(h, {"path": s["same"], "project_id": "p1"})
+    assert h.send_response.call_args[0][0] == 200, _response(h)
+    survivors = [w for w in state["wss"] if not w.get("project_mirror")]
+    assert len(survivors) == 1 and survivors[0]["name"] == "RemoteWWW", \
+        f"native-id remove must keep the sibling remote row: {state['wss']}"
+    assert _db_row(s["db"], "p1")["archived"] == 1
+
+
+@requires_manager
+@BACKENDS
+def test_native_rename_identity_does_not_rename_sibling_remote_row(equal_spelling_scenario, backend):
+    from api.routes import _handle_workspace_rename
+
+    s = equal_spelling_scenario
+    _use_backend(s, backend)
+    state = {"wss": [
+        {"path": s["same"], "name": "RemoteWWW"},
+        {"path": s["same"], "name": "HostProj", "project_mirror": True},
+    ]}
+    h = _make_handler()
+    with _state_store(state)[0], _state_store(state)[1]:
+        _handle_workspace_rename(h, {"path": s["same"], "name": "Renamed",
+                                     "project_id": "p1"})
+    assert h.send_response.call_args[0][0] == 200, _response(h)
+    remote_rows = [w for w in state["wss"] if not w.get("project_mirror")]
+    assert remote_rows and remote_rows[0]["name"] == "RemoteWWW", \
+        f"native-id rename must leave the sibling remote row's label alone: {state['wss']}"
+    assert _db_row(s["db"], "p1")["name"] == "Renamed"

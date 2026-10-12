@@ -30223,8 +30223,17 @@ def _handle_workspace_remove(handler, body):
             db_lexical = set()
         local_row = next((w for w in wss if _same_path(w.get("path", ""), path_str)), None)
 
-        def _remove_local_and_respond():
-            remaining = [w for w in wss if not _same_path(w["path"], path_str)]
+        def _remove_local_and_respond(drop_mirror=None):
+            # drop_mirror=None: legacy — drop every row at the spelling (old
+            # behavior). True/False: identity lanes drop ONLY the row matching
+            # that provenance, so a same-spelling sibling row survives (round 3).
+            def _drop(w):
+                if not _same_path(w["path"], path_str):
+                    return False
+                if drop_mirror is None:
+                    return True
+                return bool(w.get("project_mirror")) is drop_mirror
+            remaining = [w for w in wss if not _drop(w)]
             try:
                 save_workspaces(remaining, profile=active_profile)
             except TypeError:
@@ -30240,9 +30249,12 @@ def _handle_workspace_remove(handler, body):
             # A replay after the row is gone (or a claim against a mirror row)
             # is stale -> 404; it must never fall through to the no-local-row
             # lane and archive a native project at a coinciding spelling.
-            if local_row is None or local_row.get("project_mirror"):
+            remote_row = next((w for w in wss
+                               if _same_path(w.get("path", ""), path_str)
+                               and not w.get("project_mirror")), None)
+            if remote_row is None:
                 return bad(handler, "Workspace not found", 404)
-            return _remove_local_and_respond()
+            return _remove_local_and_respond(drop_mirror=False)
         if req_project_id:
             # Explicit native identity: archive EXACTLY that project. Already
             # archived / deleted is idempotent success (clean up any local
@@ -30254,7 +30266,7 @@ def _handle_workspace_remove(handler, body):
                     "Could not archive the shared Hermes Project (projects writer unavailable); "
                     "workspace left unchanged.",
                 )
-            return _remove_local_and_respond()
+            return _remove_local_and_respond(drop_mirror=True)
 
         if local_row is not None:
             remote_literal = remote_spelled and not local_row.get("project_mirror")
@@ -30322,10 +30334,16 @@ def _handle_workspace_rename(handler, body):
         local_hit = next((w for w in wss
                           if _path_key(w.get("path", ""), profile=active_profile) == target_key), None)
 
-        def _rename_local_and_respond():
+        def _rename_local_and_respond(only_mirror=None):
+            # only_mirror=None: legacy — rename every row at the spelling.
+            # True/False: identity lanes rename ONLY the row matching that
+            # provenance so a same-spelling sibling row keeps its label (round 3).
             for w in wss:
-                if _path_key(w.get("path", ""), profile=active_profile) == target_key:
-                    w["name"] = name
+                if _path_key(w.get("path", ""), profile=active_profile) != target_key:
+                    continue
+                if only_mirror is not None and bool(w.get("project_mirror")) is not only_mirror:
+                    continue
+                w["name"] = name
             try:
                 save_workspaces(wss, profile=active_profile)
             except TypeError:
@@ -30340,9 +30358,12 @@ def _handle_workspace_rename(handler, body):
             # Explicit remote-target claim: rename ONLY the saved local row,
             # never the native project its spelling happens to coincide with.
             # Stale claim (row gone) or mirror provenance -> 404.
-            if local_hit is None or local_hit.get("project_mirror"):
+            remote_row = next((w for w in wss
+                               if _path_key(w.get("path", ""), profile=active_profile) == target_key
+                               and not w.get("project_mirror")), None)
+            if remote_row is None:
                 return bad(handler, "Workspace not found", 404)
-            return _rename_local_and_respond()
+            return _rename_local_and_respond(only_mirror=False)
         if req_project_id:
             # Explicit native identity: rename EXACTLY that project; a stale
             # request renames nothing rather than a path-selected successor.
@@ -30352,9 +30373,15 @@ def _handle_workspace_rename(handler, body):
                 if result.get("reason") in ("not-found", "no-db", "disabled"):
                     return bad(handler, "Workspace not found", 404)
                 return bad(handler, "Could not rename the shared Hermes Project (projects writer unavailable); workspace left unchanged.", 500)
-            # Mirror rows keep a local copy of the name; refresh it too.
-            if local_hit is not None:
-                local_hit["name"] = name
+            # Mirror rows keep a local copy of the name; refresh ONLY the mirror
+            # row — a plain local row at the same spelling is a different target.
+            if any(w.get("project_mirror") and
+                   _path_key(w.get("path", ""), profile=active_profile) == target_key
+                   for w in wss):
+                for w in wss:
+                    if (_path_key(w.get("path", ""), profile=active_profile) == target_key
+                            and w.get("project_mirror")):
+                        w["name"] = name
                 try:
                     save_workspaces(wss, profile=active_profile)
                 except TypeError:
