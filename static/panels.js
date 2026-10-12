@@ -6352,16 +6352,25 @@ async function activateCurrentWorkspace(){
 
 async function deleteCurrentWorkspace(){
   if (!_currentWorkspaceDetail) return;
-  const path = _currentWorkspaceDetail.path;
+  // Round 7: capture the COMPLETE target identity at invocation — the detail
+  // may change while the confirm dialog / request is pending, and the
+  // request must still name the row the user confirmed.
+  const target = {path: _currentWorkspaceDetail.path,
+                  workspace_kind: _currentWorkspaceDetail.workspace_kind || '',
+                  project_id: _currentWorkspaceDetail.project_id || ''};
+  const path = target.path;
   const _ok = await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
   if(!_ok) return;
   try{
     const body={path};
-    if(_currentWorkspaceDetail.workspace_kind) body.workspace_kind=_currentWorkspaceDetail.workspace_kind;
-    if(_currentWorkspaceDetail.project_id) body.project_id=_currentWorkspaceDetail.project_id;
+    if(target.workspace_kind) body.workspace_kind=target.workspace_kind;
+    if(target.project_id) body.project_id=target.project_id;
     const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify(body)});
     _workspaceList=data.workspaces;
-    _clearWorkspaceDetail();
+    const cd=_currentWorkspaceDetail;
+    // Only clear the detail if it still shows the removed row.
+    if(cd && cd.path===target.path && (cd.workspace_kind||'')===target.workspace_kind
+       && (cd.project_id||'')===target.project_id) _clearWorkspaceDetail();
     renderWorkspacesPanel(data.workspaces);
     showToast(t('workspace_removed'));
   }catch(e){setStatus(t('remove_failed')+e.message);}
@@ -6450,11 +6459,16 @@ async function saveWorkspaceForm(){
   if (!path) { errEl.textContent = t('workspace_path_required') || 'Path is required'; errEl.style.display = ''; return; }
   try {
     if (_workspaceMode === 'edit' && _currentWorkspaceDetail) {
-      const targetPath = _currentWorkspaceDetail.path;
+      // Round 7: retain the complete invocation identity across the awaits
+      // below instead of re-reading the mutable _currentWorkspaceDetail.
+      const target = {path: _currentWorkspaceDetail.path,
+                      workspace_kind: _currentWorkspaceDetail.workspace_kind || '',
+                      project_id: _currentWorkspaceDetail.project_id || ''};
+      const targetPath = target.path;
       const newName = name || _currentWorkspaceDetail.name || '';
       const body = { path: targetPath, name: newName };
-      if(_currentWorkspaceDetail.workspace_kind) body.workspace_kind=_currentWorkspaceDetail.workspace_kind;
-      if(_currentWorkspaceDetail.project_id) body.project_id=_currentWorkspaceDetail.project_id;
+      if(target.workspace_kind) body.workspace_kind=target.workspace_kind;
+      if(target.project_id) body.project_id=target.project_id;
       await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify(body) });
       // Refresh list and re-render detail
       const data = await api('/api/workspaces');
@@ -6465,8 +6479,8 @@ async function saveWorkspaceForm(){
       // Re-open by identity, not path alone (round 3: two rows may share a
       // spelling; the renamed one is the one carrying this kind/project_id).
       openWorkspaceDetail({path: targetPath,
-        workspace_kind: _currentWorkspaceDetail.workspace_kind || '',
-        project_id: _currentWorkspaceDetail.project_id || ''});
+        workspace_kind: target.workspace_kind,
+        project_id: target.project_id});
       return;
     }
     const asProjectEl = $('workspaceFormAsProject');

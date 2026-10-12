@@ -326,6 +326,21 @@ def load_hermes_project_workspaces(profile_home: Path | None = None) -> list[dic
     return entries if ok else []
 
 
+def _stamp_remote_kind(w: dict, profile: str | Path | None) -> dict:
+    """Copy of a local row with ``workspace_kind='remote'`` stamped when it is
+    a remote literal (no mirror provenance, remote-spelled for ``profile``).
+
+    Explicit remote-target identity (re-gate round 3): the picker carries the
+    kind through rename/remove/reorder so the server never has to re-infer
+    provenance from path shape after the row vanishes. Applied on EVERY
+    projection path, including the unreadable/empty-store pass-through."""
+    entry = dict(w)
+    if (profile is not None and not entry.get("project_mirror")
+            and _is_remote_workspace_path(str(entry.get("path", "")), profile=profile)):
+        entry["workspace_kind"] = "remote"
+    return entry
+
+
 def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = None, profile: str | Path | None = None) -> list[dict]:
     """Merge projects.db entries into a WebUI workspace list.
 
@@ -352,10 +367,13 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     Never mutates the input list.
     """
     db_entries, archived, read_ok = load_project_state(profile_home=profile_home)
-    if not read_ok:
-        return list(workspaces)
-    if not db_entries and not archived:
-        return list(workspaces)
+    if not read_ok or (not db_entries and not archived):
+        # Unreadable / empty / disabled store: local rows pass through, but
+        # remote literals STILL carry their explicit kind (round 7, re-gate
+        # blocker 3) — otherwise the picker emits identity-free path-only
+        # requests for them and a later same-spelling native project could be
+        # reinterpreted as the target of a retried/replayed request.
+        return [_stamp_remote_kind(w, profile) for w in workspaces]
     # First row wins for a shared path key: the append loop below dedupes to
     # the FIRST db_entry, so the name-override side must agree — otherwise a
     # reorder (which materializes a local row) would flip the displayed name
@@ -366,18 +384,9 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     merged: list[dict] = []
     used: set[str] = set()
     for w in workspaces:
-        entry = dict(w)
+        entry = _stamp_remote_kind(w, profile)
         path = entry.get("path", "")
-        remote_literal_row = bool(
-            profile is not None
-            and not entry.get("project_mirror")
-            and _is_remote_workspace_path(str(path), profile=profile)
-        )
-        if remote_literal_row:
-            # Explicit remote-target identity (re-gate round 3): the picker
-            # carries the kind through rename/remove so the server never has
-            # to re-infer provenance from path shape after the row vanishes.
-            entry["workspace_kind"] = "remote"
+        remote_literal_row = entry.get("workspace_kind") == "remote"
         # Row<->DB keying (re-gate must-fix, supersedes the blanket host-key
         # walk-back of 7c990429): projects.db is host-local, so genuine
         # local/native rows key the HOST form — a local row spelled under a

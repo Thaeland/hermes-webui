@@ -273,6 +273,13 @@ def equal_spelling_scenario(tmp_path, monkeypatch):
             "local": str(local)}
 
 
+def _forbid_shared_writer(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("shared-store writer must not be called")
+    monkeypatch.setattr("api.projects_bridge.archive_hermes_project", _boom)
+    monkeypatch.setattr("api.projects_bridge.rename_hermes_project", _boom)
+
+
 def _state_store(state):
     return (
         patch("api.routes.load_workspaces",
@@ -282,9 +289,12 @@ def _state_store(state):
     )
 
 
-@requires_manager
 @BACKENDS
-def test_path_only_remote_remove_replay_does_not_archive_native(equal_spelling_scenario, backend):
+def test_path_only_remote_remove_replay_does_not_archive_native(equal_spelling_scenario, backend, monkeypatch):
+    # No manager needed (greptile P2 on bbf2bbff): neither request may reach
+    # the shared-store writer, so make it fail loudly if called — this runs
+    # in CI, which has no agent checkout.
+    _forbid_shared_writer(monkeypatch)
     from api.projects_bridge import is_remote_workspace_path
     from api.routes import _handle_workspace_remove
 
@@ -364,9 +374,12 @@ def test_path_only_remove_of_host_native_project_still_archives(equal_spelling_s
     assert state["wss"] == []
 
 
-@requires_manager
 @BACKENDS
-def test_path_only_remote_rename_replay_does_not_rename_native(equal_spelling_scenario, backend):
+def test_path_only_remote_rename_replay_does_not_rename_native(equal_spelling_scenario, backend, monkeypatch):
+    # No manager needed (greptile P2 on bbf2bbff): neither request may reach
+    # the shared-store writer, so make it fail loudly if called — this runs
+    # in CI, which has no agent checkout.
+    _forbid_shared_writer(monkeypatch)
     from api.projects_bridge import is_remote_workspace_path
     from api.routes import _handle_workspace_remove, _handle_workspace_rename
 
