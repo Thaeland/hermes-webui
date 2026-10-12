@@ -6309,9 +6309,15 @@ function openWorkspaceDetail(pathOrWs, el){
     ws = _workspaceList.find(w => w.path === pathOrWs);
   } else if (pathOrWs && (typeof pathOrWs === 'object')) {
     ws = _workspaceList.find(w => w === pathOrWs)
-      || _workspaceList.find(w => w.path === pathOrWs.path
+      || _workspaceList.find(w => (w.path === pathOrWs.path || !!pathOrWs.project_id)
            && (w.project_id||'') === (pathOrWs.project_id||'')
            && (w.workspace_kind||'') === (pathOrWs.workspace_kind||''));
+    // A native row's project_id is its authoritative identity: after a
+    // reorder the visible row can carry the symlink alias while the
+    // refreshed cache holds the resolved path (same id+kind, different
+    // spelling). Rows without a project_id still require exact path
+    // equality, and a stale id matches nothing because the id equality
+    // above still has to hold.
   }
   if (!ws) return;
   _workspaceUiGen++;
