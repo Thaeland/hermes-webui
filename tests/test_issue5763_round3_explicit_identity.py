@@ -370,3 +370,124 @@ def test_remote_remove_keeps_sibling_native_mirror(equal_spelling_scenario, back
     assert len(survivors) == 1 and survivors[0]["name"] == "HostProj", \
         f"remote-kind remove must keep the sibling native mirror: {state['wss']}"
     assert _db_row(s["db"], "p1")["archived"] == 0
+
+
+# ── 6. Audit round (omp -p): reorder provenance findings F1–F4 ─────────────
+
+
+@requires_manager
+def test_second_drag_after_mirror_keeps_remote_row(tmp_path, monkeypatch):
+    """F1: remote row + materialized native mirror at one spelling; a second
+    drag of the remote row must not let first-match local_hit land on the
+    mirror and the safety net silently delete the remote row."""
+    from api.routes import _handle_workspace_reorder
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    db = _make_projects_db(home, [
+        {"id": "p1", "slug": "hostproj", "name": "HostProj", "folders": ["/srv/www"]},
+    ])
+    from api.projects_bridge import _cache
+    _cache.clear()
+    state = {"wss": [
+        {"path": "/srv/www", "name": "HostProj", "project_mirror": True},
+        {"path": "/srv/www", "name": "RemoteWWW"},
+    ]}
+    handler = _make_handler()
+    with _state_store(state)[0], _state_store(state)[1]:
+        _handle_workspace_reorder(handler, {"paths": [
+            {"path": "/srv/www", "workspace_kind": "remote", "project_id": ""},
+            {"path": "/srv/www", "workspace_kind": "", "project_id": "p1"},
+        ]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert len(state["wss"]) == 2, f"second drag must keep both rows: {state['wss']}"
+    assert state["wss"][0] == {"path": "/srv/www", "name": "RemoteWWW"}
+    assert state["wss"][1].get("project_mirror") is True
+
+
+@requires_manager
+def test_stale_project_id_reorder_materializes_nothing(tmp_path, monkeypatch):
+    """F4: replay a reorder carrying an archived project id after a successor
+    registered at the same path — the id lane must fail closed, not fall
+    back to path selection and mirror the successor."""
+    from api.routes import _handle_workspace_reorder
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    db = _make_projects_db(home, [
+        {"id": "p1", "slug": "old", "name": "Old", "folders": ["/srv/www"], "archived": 1},
+        {"id": "p2", "slug": "succ", "name": "Succ", "folders": ["/srv/www"]},
+    ])
+    from api.projects_bridge import _cache
+    _cache.clear()
+    state = {"wss": []}
+    handler = _make_handler()
+    with _state_store(state)[0], _state_store(state)[1]:
+        _handle_workspace_reorder(handler, {"paths": [
+            {"path": "/srv/www", "workspace_kind": "", "project_id": "p1"}]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert state["wss"] == [], \
+        f"stale project_id drag must not materialize the successor: {state['wss']}"
+
+
+@requires_manager
+def test_drag_materializes_project_the_row_showed(tmp_path, monkeypatch):
+    """F2: two DB projects behind one realpath (symlink spellings). The
+    projection shows the FIRST entry (bridge first-wins); dragging that row
+    must materialize the SAME project, not the last-wins dict pick."""
+    from api.routes import _handle_workspace_reorder
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    db = _make_projects_db(home, [
+        {"id": "p_a", "slug": "a", "name": "ProjA", "folders": [str(real)]},
+        {"id": "p_b", "slug": "b", "name": "ProjB", "folders": [str(link)]},
+    ])
+    from api.projects_bridge import _cache, merge_hermes_projects, path_key
+    _cache.clear()
+    merged = merge_hermes_projects([], profile_home=home, profile="default")
+    row = next(w for w in merged if path_key(w["path"]) == path_key(str(real)))
+    assert row["project_id"] == "p_a", f"projection first-wins: {row}"
+    state = {"wss": []}
+    handler = _make_handler()
+    with _state_store(state)[0], _state_store(state)[1]:
+        _handle_workspace_reorder(handler, {"paths": [
+            {"path": row["path"], "workspace_kind": "", "project_id": row["project_id"]}]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert len(state["wss"]) == 1 and state["wss"][0]["name"] == "ProjA", \
+        f"drag must materialize the project the row showed: {state['wss']}"
+
+
+@requires_manager
+def test_drag_merged_local_row_keeps_local_name(tmp_path, monkeypatch):
+    """F3: a plain local row merged with a DB project at the same path (not
+    remote) projects as ONE row carrying project_id. Dragging it must keep
+    the local row as-is — not flip provenance to mirror and lose the local
+    name."""
+    from api.routes import _handle_workspace_reorder
+    d = tmp_path / "proj"
+    d.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
+    db = _make_projects_db(home, [
+        {"id": "p1", "slug": "dbproj", "name": "DBName", "folders": [str(d)]},
+    ])
+    from api.projects_bridge import _cache
+    _cache.clear()
+    state = {"wss": [{"path": str(d), "name": "LocalName"}]}
+    handler = _make_handler()
+    with _state_store(state)[0], _state_store(state)[1]:
+        _handle_workspace_reorder(handler, {"paths": [
+            {"path": str(d), "workspace_kind": "", "project_id": "p1"}]})
+    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    assert state["wss"] == [{"path": str(d), "name": "LocalName"}], \
+        f"merged local row must persist unchanged: {state['wss']}"
