@@ -6310,8 +6310,7 @@ function openWorkspaceDetail(pathOrWs, el){
     ws = _workspaceList.find(w => w === pathOrWs)
       || _workspaceList.find(w => w.path === pathOrWs.path
            && (w.project_id||'') === (pathOrWs.project_id||'')
-           && (w.workspace_kind||'') === (pathOrWs.workspace_kind||''))
-      || ws;
+           && (w.workspace_kind||'') === (pathOrWs.workspace_kind||''));
   }
   if (!ws) return;
   document.querySelectorAll('.ws-row').forEach(e => e.classList.remove('active'));
@@ -6500,30 +6499,20 @@ async function saveWorkspaceForm(){
       if (added) openWorkspaceDetail(added);
       return;
     }
-    const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify({ path }) });
+    const addBody = { path };
+    if (name) addBody.name = name;
+    const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify(addBody) });
     _workspaceList = data.workspaces || [];
     _workspacePreFormDetail = null;
-    // Apply rename if a friendly name was supplied.
-    if (name) {
-      // Deep-audit F6: rename with the added row's FULL identity (path +
-      // project_id + workspace_kind), not path alone. Between the add and
-      // this rename a shared project may have appeared at that path (or the
-      // add itself merged onto one); a path-only rename would then rename
-      // that project in the shared DB instead of labeling our local row.
-      const addedId = (_workspaceList.find(w => w.path === (data.path || path))
-                       || _workspaceList.find(w => w.path === path) || {});
-      const renameBody = { path: data.path || path, name };
-      if (addedId.project_id) renameBody.project_id = addedId.project_id;
-      if (addedId.workspace_kind) renameBody.workspace_kind = addedId.workspace_kind;
-      try { await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify(renameBody) }); } catch(_) {}
-      const refreshed = await api('/api/workspaces');
-      _workspaceList = refreshed.workspaces || _workspaceList;
-    }
     renderWorkspacesPanel(_workspaceList);
     showToast(t('workspace_added'));
-    // Match on the server-normalized path (data.path): the user may have
-    // typed '~/x' or a trailing slash, which never equals the stored row.
-    const added = _workspaceList.find(w => w.path === (data.path || path)) || _workspaceList.find(w => w.path === path);
+    // Match the added row by identity, not first path hit: a native
+    // sibling can share the spelling and sits first in the merged list.
+    const want = data.path || path;
+    const added = _workspaceList.find(w => w.path === want && (w.workspace_kind||'') === 'remote')
+      || _workspaceList.find(w => w.path === want && !w.project_id)
+      || _workspaceList.find(w => w.path === want)
+      || _workspaceList.find(w => w.path === path);
     if (added) openWorkspaceDetail(added);
   } catch (e) {
     errEl.textContent = t('error_prefix') + e.message;

@@ -30630,6 +30630,7 @@ def _handle_workspace_reorder(handler, body):
         )
         db_by_path = {}
         active_ids: set | None = None  # None = DB unreadable -> cannot validate ids
+        _all_entries: list = []
         try:
             # First-wins per path key — MUST match merge_hermes_projects'
             # db_by_path rule (round 3 audit F2): with two DB projects behind
@@ -30722,6 +30723,17 @@ def _handle_workspace_reorder(handler, body):
                 # let it claim a local row's position — validate BEFORE the
                 # local-hit lookup. The row itself is preserved by the safety net.
                 if active_ids is not None and item_project_id not in active_ids:
+                    continue
+                # Active id still has to OWN the supplied path (greptile P2 on
+                # b6972954): an id that is live at Q plus a stale/wrong path P
+                # used to pass the active-id check, then claim P's saved row.
+                owner = next((e for e in _all_entries
+                              if str(e.get("project_id") or "") == item_project_id), None)
+                if owner is None:
+                    continue
+                owner_host = _path_key(owner["path"])
+                if (owner_host != host_key
+                        and _path_key(owner["path"], profile=active_profile) != key):
                     continue
                 # Native claim resolves to the row that IS this project: a
                 # persisted mirror, or a plain local row the projection merged

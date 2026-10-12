@@ -418,6 +418,30 @@ def test_reorder_stale_native_id_claims_no_position(host_scenario):
     assert store.rows[1].get("project_mirror") is True
 
 
+def test_reorder_active_id_wrong_path_does_not_move_other_row(host_scenario):
+    """An active native id paired with someone else's path must not claim
+    that saved row. Archive/rename already pair id+path; reorder must too."""
+    from api.routes import _handle_workspace_reorder
+
+    s = host_scenario
+    _make_projects_db(s["home"], [
+        {"id": "A", "slug": "a", "name": "A", "folders": [s["q"]]},
+        {"id": "B", "slug": "b", "name": "B", "folders": [s["p"]]},
+    ])
+    rows = [{"path": s["p"], "name": "B", "project_mirror": True},
+            {"path": s["other"], "name": "Other"}]
+    store = _Store(rows)
+    h = _call(_handle_workspace_reorder, {"paths": [
+        {"path": s["p"], "project_id": "A", "workspace_kind": ""},
+        s["other"],
+    ]}, store)
+    assert _code(h) == 200, _response(h)
+    assert [w["path"] for w in store.rows] == [s["other"], s["p"]], \
+        f"active id A must not move B's row at a different path: {store.rows}"
+    assert store.rows[1].get("project_mirror") is True
+    assert store.rows[1]["name"] == "B"
+
+
 # ── 4c. Frontend continuations keep the invocation identity ──────────────
 
 
@@ -481,6 +505,67 @@ def test_frontend_delete_and_rename_keep_invocation_identity():
           assert.deepStrictEqual(opened, {path: '/srv/www', workspace_kind: '', project_id: 'N1'},
             're-open must target the renamed row, not the newly selected one');
         })().catch((err) => { console.error(err && err.stack || err); process.exit(1); });
+    """).replace("__FNS__", fns)
+    res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
+    assert res.returncode == 0, res.stderr or res.stdout
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_frontend_add_sends_name_and_does_not_rename_native_sibling():
+    """Add beside an existing native row must send name on add and must not
+    follow up with a path-first rename that carries the native project_id."""
+    src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    fns = _extract_fn(src, "async function saveWorkspaceForm(){")
+    script = textwrap.dedent("""
+        const assert = require('assert');
+        let _currentWorkspaceDetail = null, _workspaceMode = 'create', _workspaceList = [];
+        let _workspacePreFormDetail = null;
+        const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
+        let pendingApi = [];
+        const api = (url, opts) => { const d = deferred(); pendingApi.push({url, body: opts && opts.body ? JSON.parse(opts.body) : null, d}); return d; };
+        let opened = null;
+        const renderWorkspacesPanel = () => {}, showToast = () => {};
+        const openWorkspaceDetail = (w) => { opened = w; };
+        const t = (k) => k;
+        const els = {workspaceFormName: {value: 'RemoteWWW'}, workspaceFormPath: {value: '/srv/www'},
+                     workspaceFormError: {style: {}, textContent: ''}, workspaceFormAsProject: {checked: false}};
+        const $ = (id) => els[id] || null;
+        const tick = () => new Promise(r => setImmediate(r));
+        __FNS__
+        const native = {path: '/srv/www', workspace_kind: '', project_id: 'N1', name: 'Native'};
+        const remote = {path: '/srv/www', workspace_kind: 'remote', project_id: '', name: 'RemoteWWW'};
+        (async () => {
+          const run = saveWorkspaceForm();
+          await tick();
+          assert.strictEqual(pendingApi[0].url, '/api/workspaces/add');
+          assert.deepStrictEqual(pendingApi[0].body, {path: '/srv/www', name: 'RemoteWWW'});
+          pendingApi[0].d.resolve({ok: true, path: '/srv/www', workspaces: [native, remote]});
+          await run;
+          assert.strictEqual(pendingApi.length, 1, 'must not follow up with rename; name already went on add');
+          assert.deepStrictEqual(opened, remote, 'must open the added remote row, not the native sibling');
+        })().catch((err) => { console.error(err && err.stack || err); process.exit(1); });
+    """).replace("__FNS__", fns)
+    res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
+    assert res.returncode == 0, res.stderr or res.stdout
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_frontend_open_detail_absent_identity_does_not_open():
+    src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    fns = _extract_fn(src, "function openWorkspaceDetail(pathOrWs, el){")
+    script = textwrap.dedent("""
+        const assert = require('assert');
+        let _workspaceList = [{path: '/p', project_id: 'B', workspace_kind: '', name: 'B'}];
+        let rendered = null, active = 0;
+        const document = { querySelectorAll: () => [] };
+        const _renderWorkspaceDetail = (ws) => { rendered = ws; };
+        const _closeMobileSidebarAfterPanelSelection = () => {};
+        let _workspacePreFormDetail = null;
+        __FNS__
+        openWorkspaceDetail({path: '/p', project_id: 'A', workspace_kind: ''});
+        assert.strictEqual(rendered, null, 'must not open a ghost detail for an identity not in the list');
+        openWorkspaceDetail(_workspaceList[0]);
+        assert.strictEqual(rendered, _workspaceList[0]);
     """).replace("__FNS__", fns)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
     assert res.returncode == 0, res.stderr or res.stdout
