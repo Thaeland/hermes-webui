@@ -642,6 +642,27 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
 # owning project in projects.db (soft delete: restore via Desktop/CLI stays
 # possible; _query_projects only surfaces non-archived rows).
 
+# Shared by the archive/rename subprocess programs (deep-audit F4 id-lane
+# cross-check). Spliced into each program source after its ``_key`` def, so it
+# runs in the child interpreter and resolves ``_key`` there at call time.
+# ``pdb.connect`` uses ``sqlite3.Row`` (not a tuple), and ``primary_path`` is
+# a plain string column: index rows explicitly, never type-sniff them.
+_ID_OWNS_PATH_SRC = """
+def _id_owns_path(conn, pid, match_path):
+    row = conn.execute(
+        "SELECT primary_path FROM projects WHERE id = ?", (pid,)
+    ).fetchone()
+    primary = row[0] if row is not None and row[0] else None
+    if not primary:
+        row = conn.execute(
+            "SELECT path FROM project_folders WHERE project_id = ? "
+            "ORDER BY is_primary DESC, added_at ASC LIMIT 1", (pid,)
+        ).fetchone()
+        primary = row[0] if row is not None and row[0] else None
+    return bool(primary) and _key(primary) == _key(match_path)
+"""
+
+
 _ARCHIVE_PROJECT_PROG = """
 import json, os, sys
 db_path, match_mode, match_value, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -652,6 +673,7 @@ def _key(p):
         return os.path.normcase(os.path.realpath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
     except (OSError, ValueError):
         return os.path.normcase(os.path.abspath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
+""" + _ID_OWNS_PATH_SRC + """
 try:
     from hermes_cli import projects_db as pdb
     from pathlib import Path
@@ -672,17 +694,9 @@ try:
             matches = [row[0]] if row else []
             # F4 (mirrors the in-process lane): the id must ALSO own the
             # requested path; a mismatched pair is stale/crafted input.
-            if matches and match_path is not None:
-                _p = conn.execute(
-                    "SELECT primary_path FROM projects WHERE id = ?", (match_value,)
-                ).fetchone()
-                _primary = _p[0] if _p and _p[0] else conn.execute(
-                    "SELECT path FROM project_folders WHERE project_id = ? "
-                    "ORDER BY is_primary DESC, added_at ASC LIMIT 1", (match_value,)
-                ).fetchone()
-                _primary = _primary[0] if isinstance(_primary, tuple) else None
-                if not _primary or _key(_primary) != _key(match_path):
-                    matches = []
+            if matches and match_path is not None and not _id_owns_path(
+                    conn, match_value, match_path):
+                matches = []
         else:
             key = _key(match_value)
             matches = []
@@ -884,6 +898,7 @@ def _key(p):
         return os.path.normcase(os.path.realpath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
     except (OSError, ValueError):
         return os.path.normcase(os.path.abspath(os.path.expanduser(str(p).strip()))).rstrip("/\\\\")
+""" + _ID_OWNS_PATH_SRC + """
 try:
     from hermes_cli import projects_db as pdb
     from pathlib import Path
@@ -900,17 +915,9 @@ try:
             matches = [row[0]] if row else []
             # F4 (mirrors the in-process lane): the id must ALSO own the
             # requested path; a mismatched pair is stale/crafted input.
-            if matches and match_path is not None:
-                _p = conn.execute(
-                    "SELECT primary_path FROM projects WHERE id = ?", (match_value,)
-                ).fetchone()
-                _primary = _p[0] if _p and _p[0] else conn.execute(
-                    "SELECT path FROM project_folders WHERE project_id = ? "
-                    "ORDER BY is_primary DESC, added_at ASC LIMIT 1", (match_value,)
-                ).fetchone()
-                _primary = _primary[0] if isinstance(_primary, tuple) else None
-                if not _primary or _key(_primary) != _key(match_path):
-                    matches = []
+            if matches and match_path is not None and not _id_owns_path(
+                    conn, match_value, match_path):
+                matches = []
         else:
             key = _key(match_value)
             matches = []

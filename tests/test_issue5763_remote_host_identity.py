@@ -259,10 +259,23 @@ def test_rename_db_only_project_under_remote_cwd_renames_shared_store(remote_ali
     handler = _make_handler()
     with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
          patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        # C2 follow-up: path-only + no saved row + remote spelling is
+        # ambiguous (stale remote-rename replay looks identical) -> 409, no
+        # change. The picker's DB-only row carries project_id, and that
+        # identity lane still renames (greptile P1).
         _handle_workspace_rename(handler, {"path": s["real_str"], "name": "Renamed Shared"})
+    assert handler.send_response.call_args[0][0] == 409, _response(handler)
+    assert _response(handler).get("code") == "ambiguous_target", _response(handler)
+    assert _db_state(s["db"])["name"] == "HostProj", \
+        "path-only remote-spelled rename with no saved row must not rename by inference"
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_rename(handler, {"path": s["real_str"], "name": "Renamed Shared",
+                                           "project_id": "p1"})
     assert handler.send_response.call_args[0][0] == 200, _response(handler)
     assert _db_state(s["db"])["name"] == "Renamed Shared", \
-        "a DB-only shared project under a remote cwd must remain renamable (greptile P1)"
+        "a DB-only shared project under a remote cwd must remain renamable by project_id (greptile P1)"
 
 
 @requires_manager
@@ -274,10 +287,23 @@ def test_remove_db_only_project_under_remote_cwd_archives(remote_alias_scenario)
     handler = _make_handler()
     with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
          patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        # C2 follow-up: a path-only request for a remote-spelled path with no
+        # saved row is indistinguishable from a stale remote-remove replay, so
+        # it 409s (ambiguous_target) without archiving. The picker's DB-only
+        # row carries the project_id, and that identity lane still archives
+        # (greptile P1).
         _handle_workspace_remove(handler, {"path": s["real_str"]})
+    assert handler.send_response.call_args[0][0] == 409, _response(handler)
+    assert _response(handler).get("code") == "ambiguous_target", _response(handler)
+    assert _db_state(s["db"])["archived"] == 0, \
+        "path-only remote-spelled remove with no saved row must not archive by inference"
+    handler = _make_handler()
+    with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
+         patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
+        _handle_workspace_remove(handler, {"path": s["real_str"], "project_id": "p1"})
     assert handler.send_response.call_args[0][0] == 200, _response(handler)
     assert _db_state(s["db"])["archived"] == 1, \
-        "removing a DB-only shared project under a remote cwd must archive it (greptile P1)"
+        "removing a DB-only shared project under a remote cwd by project_id must archive it (greptile P1)"
 
 
 @requires_manager
@@ -314,7 +340,10 @@ def test_remove_dropped_alias_row_does_not_archive_host_project(remote_alias_sce
     with patch("api.routes.load_workspaces", side_effect=lambda profile=None: [dict(w) for w in state["wss"]]), \
          patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
         _handle_workspace_remove(handler, {"path": s["alias_str"]})
-    assert handler.send_response.call_args[0][0] == 200, _response(handler)
+    # C2 follow-up: no saved row + no identity -> 409 ambiguous_target,
+    # never an archive of the realpath-coinciding project.
+    assert handler.send_response.call_args[0][0] == 409, _response(handler)
+    assert _response(handler).get("code") == "ambiguous_target", _response(handler)
     assert _db_state(s["db"])["archived"] == 0, \
         "a remote-spelled path the DB does not name lexically must never archive the realpath-coinciding host project"
 
@@ -330,7 +359,10 @@ def test_rename_dropped_alias_row_does_not_rename_host_project(remote_alias_scen
          patch("api.routes.save_workspaces", side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
         _handle_workspace_rename(handler, {"path": s["alias_str"], "name": "Hijack"})
     code = handler.send_response.call_args[0][0]
-    assert code == 404, f"remote spelling with no local row and no lexical DB owner must 404, got {code}: {_response(handler)}"
+    # C2 follow-up: no saved row + no identity on a remote spelling -> 409
+    # ambiguous_target (was 404), never a rename of the coinciding project.
+    assert code == 409, f"remote spelling with no local row and no identity must 409, got {code}: {_response(handler)}"
+    assert _response(handler).get("code") == "ambiguous_target", _response(handler)
     assert _db_state(s["db"])["name"] == "HostProj", \
         "renaming a dropped remote alias row must not rename the host project"
 

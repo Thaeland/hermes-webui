@@ -32155,12 +32155,14 @@ def _handle_workspace_remove(handler, body):
         # rows would make shared projects unrenamable/undeletable from the
         # picker (greptile P1). A persisted mirror row was created FROM the
         # shared store (deep-audit 2b).
-        from api.projects_bridge import lexical_key
+        #
+        # C2 follow-up: lexical DB membership is NOT provenance either — with a
+        # host dir at the identical spelling, a stale path-only remote-remove
+        # replay (row already gone) looked exactly like a DB-only native row and
+        # archived it. A remote-spelled path with no saved row and no identity
+        # now gets 409 ambiguous_target below; DB-only rows under a remote cwd are removed through the
+        # project_id lane the picker already sends.
         remote_spelled = is_remote_workspace_path(path_str, profile=active_profile)
-        try:
-            db_lexical = {lexical_key(e["path"]) for e in _entries if e.get("path")}
-        except Exception:
-            db_lexical = set()
         local_row = next((w for w in wss if _same_path(w.get("path", ""), path_str)), None)
 
         def _remove_local_and_respond(drop_mirror=None):
@@ -32221,10 +32223,26 @@ def _handle_workspace_remove(handler, body):
                 )
             return _remove_local_and_respond(drop_mirror=True)
 
+        if local_row is None and remote_spelled:
+            # Path-only request for a remote-spelled path with NO saved row and
+            # NO identity (re-gate C2): this is exactly what a replayed remote
+            # remove looks like once its row is gone, and it is indistinguishable
+            # from a DB-only native row at the same spelling. Spelling is not
+            # provenance — never archive a native project by inference here. The
+            # picker carries project_id for native rows, so DB-only projects
+            # under a remote cwd stay removable through the identity lane.
+            # 409 + explicit code (same shape as session_profile_mismatch):
+            # nothing is dropped or archived; the caller must name its target.
+            return j(handler, {
+                "error": ("Ambiguous remove target: this path is remote-spelled and has "
+                          "no saved workspace row; include project_id (shared Hermes "
+                          "Project) or workspace_kind (remote workspace) to remove it."),
+                "code": "ambiguous_target",
+            }, status=409)
         if local_row is not None:
             remote_literal = remote_spelled and not local_row.get("project_mirror")
         else:
-            remote_literal = remote_spelled and lexical_key(path_str) not in db_lexical
+            remote_literal = False
         shared_backed = host_path in db_paths and not remote_literal
         if shared_backed:
             result = archive_hermes_project(host_path)
@@ -32350,6 +32368,20 @@ def _handle_workspace_rename(handler, body):
         if local_hit is not None:
             local_hit["name"] = name
         else:
+            from api.projects_bridge import is_remote_workspace_path
+            if is_remote_workspace_path(path_str, profile=active_profile):
+                # C2 follow-up (consistent with remove): a path-only rename of a
+                # remote-spelled path with NO saved row and NO identity cannot
+                # tell a stale remote-rename replay from a DB-only native row at
+                # the same spelling. Spelling is not provenance — never rename a
+                # native project by inference. Nothing is changed; the picker
+                # carries project_id for native rows (identity lane above).
+                return j(handler, {
+                    "error": ("Ambiguous rename target: this path is remote-spelled and has "
+                              "no saved workspace row; include project_id (shared Hermes "
+                              "Project) or workspace_kind (remote workspace) to rename it."),
+                    "code": "ambiguous_target",
+                }, status=409)
             # Not in the local list: a DB-only project (created from Desktop/CLI)
             # still appears in the picker via the read bridge — rename it in the
             # DB, which is authoritative for the name of a path it owns.
@@ -32357,7 +32389,7 @@ def _handle_workspace_rename(handler, body):
             # a path no project owns is a 404 even when the writer is
             # unreachable — a 500 here misreports "workspace not found" as a
             # server fault (re-gate low).
-            from api.projects_bridge import lexical_key, load_project_state, merge_hermes_projects, rename_hermes_project
+            from api.projects_bridge import load_project_state, merge_hermes_projects, rename_hermes_project
             _entries, _archived, read_ok = load_project_state()
             if not read_ok:
                 return bad(handler, "Could not verify project ownership (projects.db unreadable); workspace left unchanged.", 500)
@@ -32365,29 +32397,16 @@ def _handle_workspace_rename(handler, body):
                 _db_keys = {_path_key(e["path"]) for e in _entries if e.get("path")}
             except Exception:
                 _db_keys = set()
-            from api.projects_bridge import is_remote_workspace_path
             if _path_key(path_str) not in _db_keys:
                 # Host key: projects.db is host-local (deep-audit 2b). Reaching
-                # this branch means NO local row matched, so the picker row came
-                # FROM projects.db itself (Desktop/CLI-created) — a native entry
-                # even when its spelling falls under a remote terminal.cwd
-                # (greptile P1: blocking these made shared projects
-                # unrenamable). A remote literal always has a saved local row;
-                # that lane is gated in the local-row branch below.
+                # this branch means NO local row matched and the path is not
+                # remote-spelled, so a picker row here came FROM projects.db
+                # itself (Desktop/CLI-created). DB-only rows under a remote cwd
+                # stay renamable through the project_id lane (greptile P1).
                 return bad(handler, "Workspace not found", 404)
-            if is_remote_workspace_path(path_str, profile=active_profile):
-                # OCR high: no local row + remote spelling — the host-key check
-                # above can pass purely through a symlink coincidence (host
-                # symlink `alias -> real`, DB owns `real`). The DB must name the
-                # SPELLING lexically to prove this row came from it; otherwise
-                # this is a remote literal whose row was dropped/filtered, and
-                # renaming through the coincidence would rename the host project.
-                try:
-                    _db_lexical = {lexical_key(e["path"]) for e in _entries if e.get("path")}
-                except Exception:
-                    _db_lexical = set()
-                if lexical_key(path_str) not in _db_lexical:
-                    return bad(handler, "Workspace not found", 404)
+            # (Remote-spelled paths with no saved row already returned 409
+            # ambiguous_target above — this lane is host paths only, so the old
+            # OCR-high lexical-ownership gate for symlink aliases is subsumed.)
             result = rename_hermes_project(path_str, name)
             if not result.get("renamed"):
                 if result.get("reason") in ("not-found", "no-db", "disabled"):
