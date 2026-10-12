@@ -6645,6 +6645,7 @@ async function deleteCurrentWorkspace(){
 
 function openWorkspaceCreate(){
   if (typeof switchPanel === 'function' && _currentPanel !== 'workspaces') switchPanel('workspaces');
+  _workspaceUiGen++;
   _workspacePreFormDetail = _currentWorkspaceDetail ? { ..._currentWorkspaceDetail } : null;
   _workspaceMode = 'create';
   _renderWorkspaceForm({ name:'', path:'', isEdit:false });
@@ -6656,6 +6657,7 @@ function openWorkspaceCreate(){
 
 function editCurrentWorkspace(){
   if (!_currentWorkspaceDetail) return;
+  _workspaceUiGen++;
   _workspacePreFormDetail = { ..._currentWorkspaceDetail };
   _workspaceMode = 'edit';
   _renderWorkspaceForm({ name: _currentWorkspaceDetail.name || '', path: _currentWorkspaceDetail.path || '', isEdit: true });
@@ -6706,6 +6708,7 @@ function _renderWorkspaceForm({ name, path, isEdit }){
 
 function cancelWorkspaceForm(){
   closeWorkspacePathSuggestions();
+  _workspaceUiGen++;
   if (_workspacePreFormDetail) {
     const snap = _workspacePreFormDetail;
     _workspacePreFormDetail = null;
