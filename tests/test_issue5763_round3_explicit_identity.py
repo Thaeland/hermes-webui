@@ -385,7 +385,7 @@ def test_second_drag_after_mirror_keeps_remote_row(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
     monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
-    db = _make_projects_db(home, [
+    _make_projects_db(home, [
         {"id": "p1", "slug": "hostproj", "name": "HostProj", "folders": ["/srv/www"]},
     ])
     from api.projects_bridge import _cache
@@ -416,7 +416,7 @@ def test_stale_project_id_reorder_materializes_nothing(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
     monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
-    db = _make_projects_db(home, [
+    _make_projects_db(home, [
         {"id": "p1", "slug": "old", "name": "Old", "folders": ["/srv/www"], "archived": 1},
         {"id": "p2", "slug": "succ", "name": "Succ", "folders": ["/srv/www"]},
     ])
@@ -446,7 +446,7 @@ def test_drag_materializes_project_the_row_showed(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
     monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
-    db = _make_projects_db(home, [
+    _make_projects_db(home, [
         {"id": "p_a", "slug": "a", "name": "ProjA", "folders": [str(real)]},
         {"id": "p_b", "slug": "b", "name": "ProjB", "folders": [str(link)]},
     ])
@@ -478,7 +478,7 @@ def test_drag_merged_local_row_keeps_local_name(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setattr("api.profiles.get_active_hermes_home", lambda: home)
     monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "default")
-    db = _make_projects_db(home, [
+    _make_projects_db(home, [
         {"id": "p1", "slug": "dbproj", "name": "DBName", "folders": [str(d)]},
     ])
     from api.projects_bridge import _cache

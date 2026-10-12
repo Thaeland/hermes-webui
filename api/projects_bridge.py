@@ -220,7 +220,7 @@ def _query_projects(db: Path) -> tuple[list[tuple[str, str, str]], dict[str, set
     finally:
         conn.close()
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     archived: dict[str, set[str]] = {}
     seen: set[str] = set()
     for r in rows:
