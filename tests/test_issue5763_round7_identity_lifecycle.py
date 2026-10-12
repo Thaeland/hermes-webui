@@ -474,6 +474,7 @@ def test_frontend_delete_and_rename_keep_invocation_identity():
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'edit', _workspaceList = [];
         let _workspacePreFormDetail = null;
+        let _workspaceUiGen = 0;
         const calls = [];
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingConfirm = null, pendingApi = [];
@@ -540,6 +541,7 @@ def test_frontend_add_sends_name_and_does_not_rename_native_sibling():
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'create', _workspaceList = [];
         let _workspacePreFormDetail = null;
+        let _workspaceUiGen = 0;
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingApi = [];
         const api = (url, opts) => { const d = deferred(); pendingApi.push({url, body: opts && opts.body ? JSON.parse(opts.body) : null, d}); return d; };
@@ -576,6 +578,7 @@ def test_frontend_open_detail_absent_identity_does_not_open():
     script = textwrap.dedent("""
         const assert = require('assert');
         let _workspaceList = [{path: '/p', project_id: 'B', workspace_kind: '', name: 'B'}];
+        let _workspaceUiGen = 0;
         let rendered = null, active = 0;
         const document = { querySelectorAll: () => [] };
         const _renderWorkspaceDetail = (ws) => { rendered = ws; };
@@ -586,6 +589,59 @@ def test_frontend_open_detail_absent_identity_does_not_open():
         assert.strictEqual(rendered, null, 'must not open a ghost detail for an identity not in the list');
         openWorkspaceDetail(_workspaceList[0]);
         assert.strictEqual(rendered, _workspaceList[0]);
+    """).replace("__FNS__", fns)
+    res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
+    assert res.returncode == 0, res.stderr or res.stdout
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_frontend_stale_rename_get_does_not_publish_over_new_selection():
+    """A's refresh GET already in flight, then switch to B: late A response
+    must not replace B's catalog, form snapshot, or render."""
+    src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    fns = _extract_fn(src, "async function saveWorkspaceForm(){")
+    script = textwrap.dedent("""
+        const assert = require('assert');
+        let _currentWorkspaceDetail = null, _workspaceMode = 'edit', _workspaceList = [];
+        let _workspacePreFormDetail = null;
+        let _workspaceUiGen = 0;
+        const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
+        let pendingApi = [];
+        const api = (url, opts) => { const d = deferred(); pendingApi.push({url, body: opts && opts.body ? JSON.parse(opts.body) : null, d}); return d; };
+        let opened = null, rendered = 0;
+        const renderWorkspacesPanel = () => { rendered++; };
+        const showToast = () => {};
+        const openWorkspaceDetail = (w) => { opened = w; };
+        const t = (k) => k;
+        const els = {workspaceFormName: {value: 'New Name'}, workspaceFormPath: {value: '/srv/www'},
+                     workspaceFormError: {style: {}, textContent: ''}, workspaceFormAsProject: {checked: false}};
+        const $ = (id) => els[id] || null;
+        const tick = () => new Promise(r => setImmediate(r));
+        __FNS__
+        const A = {path: '/srv/www', workspace_kind: 'remote', project_id: '', name: 'Remote'};
+        const B = {path: '/srv/www', workspace_kind: '', project_id: 'N1', name: 'Native'};
+        (async () => {
+          _currentWorkspaceDetail = A;
+          _workspaceList = [A];
+          _workspacePreFormDetail = { ...A };
+          const run = saveWorkspaceForm();
+          await tick();
+          assert.strictEqual(pendingApi[0].url, '/api/workspaces/rename');
+          pendingApi[0].d.resolve({ok: true});
+          await tick();
+          assert.strictEqual(pendingApi[1].url, '/api/workspaces');
+          _workspaceUiGen++;
+          _currentWorkspaceDetail = B;
+          _workspaceList = [B];
+          _workspacePreFormDetail = { ...B };
+          const renderedAfterSwitch = rendered;
+          pendingApi[1].d.resolve({workspaces: [A]});
+          await run;
+          assert.deepStrictEqual(_workspaceList, [B], 'late A catalog must not replace B');
+          assert.deepStrictEqual(_workspacePreFormDetail, B, 'must not clear B form snapshot');
+          assert.strictEqual(rendered, renderedAfterSwitch, 'must not re-render from stale A GET');
+          assert.strictEqual(opened, null, 'must not reopen A');
+        })().catch((err) => { console.error(err && err.stack || err); process.exit(1); });
     """).replace("__FNS__", fns)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
     assert res.returncode == 0, res.stderr or res.stdout
