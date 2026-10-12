@@ -6182,7 +6182,18 @@ function renderWorkspacesPanel(workspaces){
       e.preventDefault();
       row.classList.remove('drag-over');
       let fromId;
-      try { fromId = JSON.parse(e.dataTransfer.getData('text/plain')); } catch(_) { fromId = {path: e.dataTransfer.getData('text/plain')}; }
+      try {
+        const parsed = JSON.parse(e.dataTransfer.getData('text/plain'));
+        // Deep-audit O3: any foreign text that PARSES to a primitive (the
+        // literal 'null', a number, a bare string) must not crash on
+        // .path — only a {path: string} object is a workspace identity.
+        fromId = (parsed && typeof parsed === 'object' && typeof parsed.path === 'string')
+          ? parsed : null;
+      } catch(_) {
+        const raw = e.dataTransfer.getData('text/plain');
+        fromId = raw ? {path: raw} : null;
+      }
+      if (!fromId) return;
       const toId = {path: w.path, workspace_kind: w.workspace_kind||'', project_id: w.project_id||''};
       if(fromId.path === toId.path && (fromId.project_id||'') === (toId.project_id||'') && (fromId.workspace_kind||'') === (toId.workspace_kind||'')) return; // Same item, no-op
       // Compute new order (identity objects: same-spelling remote/native
@@ -6478,9 +6489,19 @@ async function saveWorkspaceForm(){
     const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify({ path }) });
     _workspaceList = data.workspaces || [];
     _workspacePreFormDetail = null;
-    // Apply rename if a friendly name was supplied
+    // Apply rename if a friendly name was supplied.
     if (name) {
-      try { await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify({ path, name }) }); } catch(_) {}
+      // Deep-audit F6: rename with the added row's FULL identity (path +
+      // project_id + workspace_kind), not path alone. Between the add and
+      // this rename a shared project may have appeared at that path (or the
+      // add itself merged onto one); a path-only rename would then rename
+      // that project in the shared DB instead of labeling our local row.
+      const addedId = (_workspaceList.find(w => w.path === (data.path || path))
+                       || _workspaceList.find(w => w.path === path) || {});
+      const renameBody = { path: data.path || path, name };
+      if (addedId.project_id) renameBody.project_id = addedId.project_id;
+      if (addedId.workspace_kind) renameBody.workspace_kind = addedId.workspace_kind;
+      try { await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify(renameBody) }); } catch(_) {}
       const refreshed = await api('/api/workspaces');
       _workspaceList = refreshed.workspaces || _workspaceList;
     }
