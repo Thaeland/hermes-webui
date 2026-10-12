@@ -31,6 +31,7 @@ let _cronOtherProfileCount = 0;
 let _currentWorkspaceDetail = null; // { path, name, is_default }
 let _workspaceMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _workspacePreFormDetail = null;
+let _workspaceUiGen = 0;
 let _currentProfileDetail = null; // full profile object
 let _profileMode = 'empty'; // 'empty' | 'read' | 'create'
 let _profilePreFormDetail = null;
@@ -6578,6 +6579,7 @@ function openWorkspaceDetail(pathOrWs, el){
            && (w.workspace_kind||'') === (pathOrWs.workspace_kind||''));
   }
   if (!ws) return;
+  _workspaceUiGen++;
   document.querySelectorAll('.ws-row').forEach(e => e.classList.remove('active'));
   // Match by the full identity triple via the row datasets (greptile P2):
   // a path-only selector highlights the wrong sibling when a remote row
@@ -6596,6 +6598,7 @@ function openWorkspaceDetail(pathOrWs, el){
 }
 
 function _clearWorkspaceDetail(){
+  _workspaceUiGen++;
   _currentWorkspaceDetail = null;
   _workspaceMode = 'empty';
   const title = $('workspaceDetailTitle');
@@ -6725,6 +6728,7 @@ async function saveWorkspaceForm(){
     if (_workspaceMode === 'edit' && _currentWorkspaceDetail) {
       // Round 7: retain the complete invocation identity across the awaits
       // below instead of re-reading the mutable _currentWorkspaceDetail.
+      const gen = _workspaceUiGen;
       const target = {path: _currentWorkspaceDetail.path,
                       workspace_kind: _currentWorkspaceDetail.workspace_kind || '',
                       project_id: _currentWorkspaceDetail.project_id || ''};
@@ -6734,7 +6738,9 @@ async function saveWorkspaceForm(){
       if(target.workspace_kind) body.workspace_kind=target.workspace_kind;
       if(target.project_id) body.project_id=target.project_id;
       await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify(body) });
+      if (gen !== _workspaceUiGen) return;
       const data = await api('/api/workspaces');
+      if (gen !== _workspaceUiGen) return;
       _workspaceList = data.workspaces || [];
       _workspacePreFormDetail = null;
       showToast(t('workspace_renamed') || t('workspace_added'));
