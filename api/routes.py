@@ -30550,7 +30550,13 @@ def _handle_workspace_reorder(handler, body):
         )
         db_by_path = {}
         try:
-            db_by_path = {_path_key(e["path"]): e for e in load_hermes_project_workspaces()}
+            # First-wins per path key — MUST match merge_hermes_projects'
+            # db_by_path rule (round 3 audit F2): with two DB projects behind
+            # one realpath (symlink spellings), the projection shows the FIRST
+            # entry; a last-wins dict here made a drag materialize the OTHER
+            # project than the row the user actually dragged.
+            for _e in load_hermes_project_workspaces():
+                db_by_path.setdefault(_path_key(_e["path"]), _e)
         except Exception:
             pass
         reordered = []
@@ -30587,26 +30593,62 @@ def _handle_workspace_reorder(handler, body):
                 s[0] == key for s in seen if isinstance(s, tuple)
             ):
                 continue
-            local_hit = next((w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == key), None)
-            if item_project_id and local_hit is not None and not local_hit.get("project_mirror"):
-                # The dragged native row is NOT this plain local row (a remote or
-                # local workspace at the same spelling is a different target);
-                # fall through to DB materialization of the carried project.
-                local_hit = None
-            if local_hit is not None:
-                if item_kind == "remote" and local_hit.get("project_mirror"):
-                    # Stale/contradictory claim: a mirror row is not a remote
-                    # literal; skip rather than reorder under the wrong identity.
-                    continue
-                if item_project_id and not local_hit.get("project_mirror"):
-                    # Contradictory: a plain local row is not a native project.
+            from api.projects_bridge import is_remote_workspace_path, lexical_key
+
+            def _at_key(w, k=key):  # k bound at definition (ruff B023)
+                return _path_key(w.get("path", ""), profile=active_profile) == k
+
+            def _remote_literal(w):
+                return bool(not w.get("project_mirror")
+                            and is_remote_workspace_path(str(w.get("path", "")),
+                                                         profile=active_profile))
+
+            local_hit = None
+            if item_kind == "remote":
+                # Remote claim resolves to the NON-mirror row at the spelling
+                # (round 3 audit F1): a first-match lookup could land on the
+                # native mirror of a same-spelling project, skip the item, and
+                # let the safety-net path suppression silently DELETE the
+                # remote row on a second drag.
+                local_hit = next((w for w in wss if _at_key(w) and not w.get("project_mirror")), None)
+                if local_hit is None:
+                    # Stale remote claim (row already removed): never
+                    # materialize anything for it.
                     continue
                 reordered.append(local_hit)
                 seen.add(ident)
-            elif item_kind == "remote":
-                # Explicit remote claim with no local row: stale (row already
-                # removed) — never materialize anything for it.
                 continue
+            if item_project_id:
+                # Native claim resolves to the row that IS this project: a
+                # persisted mirror, or a plain local row the projection merged
+                # with the DB entry (audit F3 — nulling that out flipped a
+                # merged local row into a mirror and lost its local name). A
+                # remote literal at the same spelling is a different target.
+                local_hit = next((w for w in wss if _at_key(w)
+                                  and (w.get("project_mirror") or not _remote_literal(w))), None)
+                if local_hit is not None:
+                    reordered.append(local_hit)
+                    seen.add(ident)
+                    continue
+                # No local row: materialize EXACTLY the carried project id.
+                # Audit F4: NO path fallback — a stale id whose project is gone
+                # must skip (fail closed), never materialize a successor that
+                # later appeared at the same spelling.
+                entry = next(
+                    (e for e in db_by_path.values()
+                     if str(e.get("project_id") or "") == item_project_id),
+                    None,
+                )
+                if entry is None:
+                    continue
+                row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
+                reordered.append(row)
+                seen.add(ident)
+                continue
+            local_hit = next((w for w in wss if _at_key(w)), None)
+            if local_hit is not None:
+                reordered.append(local_hit)
+                seen.add(ident)
             elif host_key in db_by_path or key in db_by_path:
                 # No local row: the dragged picker row came FROM projects.db
                 # (Desktop/CLI-created), a native entry even when its spelling
@@ -30616,7 +30658,6 @@ def _handle_workspace_reorder(handler, body):
                 # (host symlink `alias -> real`, DB owns `real`): the DB must
                 # name the spelling lexically, or the drag would materialize the
                 # unrelated host project's row over the remote alias (OCR high).
-                from api.projects_bridge import is_remote_workspace_path, lexical_key
                 if is_remote_workspace_path(p, profile=active_profile):
                     try:
                         _db_lexical = {lexical_key(e["path"]) for e in load_hermes_project_workspaces()}
@@ -30624,16 +30665,7 @@ def _handle_workspace_reorder(handler, body):
                         _db_lexical = set()
                     if lexical_key(p) not in _db_lexical:
                         continue
-                if item_project_id:
-                    # Explicit native identity: materialize EXACTLY that project
-                    # (round 3 must-fix 1: two same-spelling targets — the id
-                    # disambiguates which DB row the dragged row showed).
-                    entry = next(
-                        (e for e in db_by_path.values() if str(e.get("project_id") or "") == item_project_id),
-                        None,
-                    ) or db_by_path.get(host_key) or db_by_path[key]
-                else:
-                    entry = db_by_path.get(host_key) or db_by_path[key]
+                entry = db_by_path.get(host_key) or db_by_path[key]
                 # Materialized from the shared store -> mirror provenance, so a
                 # later archive hides exactly this row (must-fix 1 contract).
                 row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
