@@ -6414,7 +6414,15 @@ function renderWorkspacesPanel(workspaces){
     // Click on info area only — not on drag handle
     const info=row.querySelector('.ws-row-info');
     if(info) info.onclick = (e) => { e.stopPropagation(); openWorkspaceDetail(w, row); };
-    if (_currentWorkspaceDetail && _currentWorkspaceDetail === w) row.classList.add('active');
+    // Highlight by IDENTITY, not object reference (greptile P2): reorder/
+    // rename responses are freshly-serialized dicts, so reference equality
+    // loses the highlight after any refresh; and a path-only match would
+    // highlight the wrong row when a remote row and a native mirror share
+    // one spelling (round 3 identity triple, same as the detail refresh).
+    const _cd = _currentWorkspaceDetail;
+    if (_cd && (_cd === w || (w.path === _cd.path
+         && (w.project_id||'') === (_cd.project_id||'')
+         && (w.workspace_kind||'') === (_cd.workspace_kind||'')))) row.classList.add('active');
 
     // ── Drag-and-drop reorder ──
     row.addEventListener('dragstart', (e) => {
@@ -6561,7 +6569,16 @@ function openWorkspaceDetail(pathOrWs, el){
   }
   if (!ws) return;
   document.querySelectorAll('.ws-row').forEach(e => e.classList.remove('active'));
-  const target = el || document.querySelector(`.ws-row[data-path="${CSS.escape(ws.path)}"]`);
+  // Match by the full identity triple via the row datasets (greptile P2):
+  // a path-only selector highlights the wrong sibling when a remote row
+  // and a native mirror share one spelling.
+  let target = el;
+  if (!target) {
+    target = Array.from(document.querySelectorAll('.ws-row')).find(r =>
+      r.dataset.path === ws.path
+      && (r.dataset.projectId||'') === (ws.project_id||'')
+      && (r.dataset.workspaceKind||'') === (ws.workspace_kind||''));
+  }
   if (target) target.classList.add('active');
   _workspacePreFormDetail = null;
   _renderWorkspaceDetail(ws);
