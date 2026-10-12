@@ -6699,7 +6699,11 @@ async function saveWorkspaceForm(){
       _workspacePreFormDetail = null;
       showToast(t('workspace_renamed') || t('workspace_added'));
       renderWorkspacesPanel(_workspaceList);
-      openWorkspaceDetail(targetPath);
+      // Re-open by identity, not path alone (round 3: two rows may share a
+      // spelling; the renamed one is the one carrying this kind/project_id).
+      openWorkspaceDetail({path: targetPath,
+        workspace_kind: _currentWorkspaceDetail.workspace_kind || '',
+        project_id: _currentWorkspaceDetail.project_id || ''});
       return;
     }
     const asProjectEl = $('workspaceFormAsProject');
@@ -6716,7 +6720,7 @@ async function saveWorkspaceForm(){
       // and the last-element fallback would open a DB-only neighbor instead.
       const want = proj.path || path;
       const added = _workspaceList.find(w => w.path === want) || _workspaceList.find(w => w.path === path);
-      if (added) openWorkspaceDetail(added.path);
+      if (added) openWorkspaceDetail(added);
       return;
     }
     const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify({ path }) });
@@ -6733,7 +6737,7 @@ async function saveWorkspaceForm(){
     // Match on the server-normalized path (data.path): the user may have
     // typed '~/x' or a trailing slash, which never equals the stored row.
     const added = _workspaceList.find(w => w.path === (data.path || path)) || _workspaceList.find(w => w.path === path);
-    if (added) openWorkspaceDetail(added.path);
+    if (added) openWorkspaceDetail(added);
   } catch (e) {
     errEl.textContent = t('error_prefix') + e.message;
     errEl.style.display = '';
