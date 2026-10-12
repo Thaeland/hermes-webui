@@ -645,3 +645,98 @@ def test_frontend_stale_rename_get_does_not_publish_over_new_selection():
     """).replace("__FNS__", fns)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
     assert res.returncode == 0, res.stderr or res.stdout
+
+
+def _workspace_form_harness(src: str, body: str) -> str:
+    fns = "\n".join([
+        _extract_fn(src, "async function saveWorkspaceForm(){"),
+        _extract_fn(src, "function openWorkspaceCreate(){"),
+        _extract_fn(src, "function editCurrentWorkspace(){"),
+        _extract_fn(src, "function cancelWorkspaceForm(){"),
+    ])
+    return textwrap.dedent("""
+        const assert = require('assert');
+        let _currentWorkspaceDetail = null, _workspaceMode = 'edit', _workspaceList = [];
+        let _workspacePreFormDetail = null;
+        let _workspaceUiGen = 0;
+        let _currentPanel = 'workspaces';
+        const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
+        let pendingApi = [];
+        const api = (url, opts) => { const d = deferred(); pendingApi.push({url, body: opts && opts.body ? JSON.parse(opts.body) : null, d}); return d; };
+        let opened = null, rendered = 0;
+        const renderWorkspacesPanel = () => { rendered++; };
+        const showToast = () => {};
+        const openWorkspaceDetail = (w) => { opened = w; };
+        const switchPanel = () => {};
+        const _closeMobileSidebarAfterPanelSelection = () => {};
+        const closeWorkspacePathSuggestions = () => {};
+        const _renderWorkspaceForm = () => {};
+        const _renderWorkspaceDetail = (ws) => { _currentWorkspaceDetail = ws; _workspaceMode = 'read'; };
+        const _clearWorkspaceDetail = () => { _workspaceUiGen++; _currentWorkspaceDetail = null; _workspaceMode = 'empty'; };
+        const t = (k) => k;
+        const els = {workspaceFormName: {value: 'New Name'}, workspaceFormPath: {value: '/srv/www'},
+                     workspaceFormError: {style: {}, textContent: ''}, workspaceFormAsProject: {checked: false}};
+        const $ = (id) => els[id] || null;
+        const tick = () => new Promise(r => setImmediate(r));
+        __FNS__
+        const A = {path: '/srv/www', workspace_kind: 'remote', project_id: '', name: 'Remote'};
+        (async () => {
+          __BODY__
+        })().catch((err) => { console.error(err && err.stack || err); process.exit(1); });
+    """).replace("__FNS__", fns).replace("__BODY__", textwrap.dedent(body).strip())
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_frontend_stale_rename_get_does_not_clobber_new_space_form():
+    src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    script = _workspace_form_harness(src, """
+          _currentWorkspaceDetail = A;
+          _workspaceList = [A];
+          _workspacePreFormDetail = { ...A };
+          const run = saveWorkspaceForm();
+          await tick();
+          pendingApi[0].d.resolve({ok: true});
+          await tick();
+          assert.strictEqual(pendingApi[1].url, '/api/workspaces');
+          openWorkspaceCreate();
+          assert.strictEqual(_workspaceMode, 'create');
+          const snap = _workspacePreFormDetail;
+          const renderedAfter = rendered;
+          pendingApi[1].d.resolve({workspaces: [A]});
+          await run;
+          assert.strictEqual(_workspaceMode, 'create', 'late A GET must not switch create → read');
+          assert.deepStrictEqual(_workspacePreFormDetail, snap, 'must keep the newer form snapshot');
+          assert.strictEqual(rendered, renderedAfter, 'must not re-render from stale A GET');
+          assert.strictEqual(opened, null);
+    """)
+    res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
+    assert res.returncode == 0, res.stderr or res.stdout
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_frontend_stale_rename_get_does_not_clobber_reopened_edit_form():
+    src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    script = _workspace_form_harness(src, """
+          _currentWorkspaceDetail = A;
+          _workspaceList = [A];
+          _workspacePreFormDetail = { ...A };
+          const run = saveWorkspaceForm();
+          await tick();
+          pendingApi[0].d.resolve({ok: true});
+          await tick();
+          assert.strictEqual(pendingApi[1].url, '/api/workspaces');
+          cancelWorkspaceForm();
+          _currentWorkspaceDetail = A;
+          editCurrentWorkspace();
+          assert.strictEqual(_workspaceMode, 'edit');
+          const snap = _workspacePreFormDetail;
+          const renderedAfter = rendered;
+          pendingApi[1].d.resolve({workspaces: [A]});
+          await run;
+          assert.strictEqual(_workspaceMode, 'edit', 'late A GET must not switch edit → read');
+          assert.deepStrictEqual(_workspacePreFormDetail, snap, 'must keep the newer edit snapshot');
+          assert.strictEqual(rendered, renderedAfter);
+          assert.strictEqual(opened, null);
+    """)
+    res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
+    assert res.returncode == 0, res.stderr or res.stdout
