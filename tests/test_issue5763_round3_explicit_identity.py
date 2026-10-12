@@ -349,3 +349,24 @@ def test_native_rename_identity_does_not_rename_sibling_remote_row(equal_spellin
     assert remote_rows and remote_rows[0]["name"] == "RemoteWWW", \
         f"native-id rename must leave the sibling remote row's label alone: {state['wss']}"
     assert _db_row(s["db"], "p1")["name"] == "Renamed"
+
+
+@requires_manager
+@BACKENDS
+def test_remote_remove_keeps_sibling_native_mirror(equal_spelling_scenario, backend):
+    from api.routes import _handle_workspace_remove
+
+    s = equal_spelling_scenario
+    _use_backend(s, backend)
+    state = {"wss": [
+        {"path": s["same"], "name": "RemoteWWW"},
+        {"path": s["same"], "name": "HostProj", "project_mirror": True},
+    ]}
+    h = _make_handler()
+    with _state_store(state)[0], _state_store(state)[1]:
+        _handle_workspace_remove(h, {"path": s["same"], "workspace_kind": "remote"})
+    assert h.send_response.call_args[0][0] == 200, _response(h)
+    survivors = [w for w in state["wss"] if w.get("project_mirror")]
+    assert len(survivors) == 1 and survivors[0]["name"] == "HostProj", \
+        f"remote-kind remove must keep the sibling native mirror: {state['wss']}"
+    assert _db_row(s["db"], "p1")["archived"] == 0
