@@ -30227,11 +30227,24 @@ def _handle_workspace_remove(handler, body):
             # drop_mirror=None: legacy — drop every row at the spelling (old
             # behavior). True/False: identity lanes drop ONLY the row matching
             # that provenance, so a same-spelling sibling row survives (round 3).
+            # True additionally drops a PLAIN local row that is not a remote
+            # literal: a folder added locally first and registered in
+            # projects.db later has no mirror provenance, yet the projection
+            # stamps its picker row with the project_id the request carries —
+            # keeping the row would re-list a workspace whose shared project was
+            # just archived (greptile P1). Only a remote-literal sibling at the
+            # same spelling is preserved (round 3).
+            from api.projects_bridge import is_remote_workspace_path
+
             def _drop(w):
                 if not _same_path(w["path"], path_str):
                     return False
                 if drop_mirror is None:
                     return True
+                if drop_mirror is True:
+                    return (bool(w.get("project_mirror"))
+                            or not is_remote_workspace_path(str(w.get("path", "")),
+                                                            profile=active_profile))
                 return bool(w.get("project_mirror")) is drop_mirror
             remaining = [w for w in wss if not _drop(w)]
             try:
@@ -30329,7 +30342,7 @@ def _handle_workspace_rename(handler, body):
             wss = load_workspaces(profile=active_profile)
         except TypeError:
             wss = load_workspaces()
-        from api.projects_bridge import path_key as _path_key
+        from api.projects_bridge import merge_hermes_projects, path_key as _path_key
         target_key = _path_key(path_str, profile=active_profile)
         local_hit = next((w for w in wss
                           if _path_key(w.get("path", ""), profile=active_profile) == target_key), None)
@@ -30671,10 +30684,32 @@ def _handle_workspace_reorder(handler, body):
                 row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
                 reordered.append(row)
                 seen.add(ident)
-        # Append any workspaces not mentioned (safety net)
-        seen_paths = {s[0] if isinstance(s, tuple) else s for s in seen}
+        # Append any workspaces not mentioned (safety net). Suppression must use
+        # the SAME identity granularity as the main loop (greptile P1): a legacy
+        # path-only entry claims every row at its spelling (first-wins, deep-audit
+        # P2), but an identity entry claims ONLY the row it addresses — otherwise
+        # a stale tab dragging just the native row silently deleted a same-spelling
+        # remote row another tab had added.
+        from api.projects_bridge import is_remote_workspace_path as _is_remote_p
+
+        def _row_is_native(w):
+            # The row the native (project_id) claim addresses: a persisted mirror
+            # or a plain local row — never a remote literal (round 3 identity).
+            return bool(w.get("project_mirror")) or not _is_remote_p(
+                str(w.get("path", "")), profile=active_profile)
+
+        legacy_seen = {s for s in seen if not isinstance(s, tuple)}
+        identity_seen = {s for s in seen if isinstance(s, tuple)}
         for w in wss:
-            if _path_key(w.get("path", ""), profile=active_profile) not in seen_paths:
+            wkey = _path_key(w.get("path", ""), profile=active_profile)
+            if wkey in legacy_seen:
+                continue
+            covered = any(
+                s[0] == wkey and ((s[2] == "remote" and not _row_is_native(w))
+                                  or (s[1] and _row_is_native(w)))
+                for s in identity_seen
+            )
+            if not covered:
                 reordered.append(w)
         try:
             save_workspaces(reordered, profile=active_profile)
