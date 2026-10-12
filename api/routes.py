@@ -20104,20 +20104,29 @@ def handle_post(handler, parsed) -> bool:
         return _handle_file_open_vscode(handler, body)
 
     # ── Workspace management (POST) ──
-    if parsed.path == "/api/workspaces/add":
-        return _handle_workspace_add(handler, body)
-
-    if parsed.path == "/api/workspaces/remove":
-        return _handle_workspace_remove(handler, body)
-
-    if parsed.path == "/api/workspaces/create_project":
-        return _handle_workspace_create_project(handler, body)
-
-    if parsed.path == "/api/workspaces/rename":
-        return _handle_workspace_rename(handler, body)
-
-    if parsed.path == "/api/workspaces/reorder":
-        return _handle_workspace_reorder(handler, body)
+    # Deep-audit F3: every workspace mutation is a load→mutate→save on
+    # workspaces.json, and the projects.db bridge widened that window from
+    # microseconds to seconds (DB round-trips, archive subprocess up to 30s).
+    # ThreadingHTTPServer runs one thread per request, so two concurrent
+    # mutations (or a mutation racing another handler's save) would
+    # last-writer-wins a stale list and silently drop the other's change.
+    # Serialize all five mutations on one process-wide lock: mutations are
+    # rare and short, and correctness of the shared picker list beats the
+    # lost millisecond of contention. (save_workspaces is additionally atomic.)
+    if parsed.path in ("/api/workspaces/add", "/api/workspaces/remove",
+                       "/api/workspaces/create_project", "/api/workspaces/rename",
+                       "/api/workspaces/reorder"):
+        from api.workspace import WORKSPACE_MUTATION_LOCK
+        with WORKSPACE_MUTATION_LOCK:
+            if parsed.path == "/api/workspaces/add":
+                return _handle_workspace_add(handler, body)
+            if parsed.path == "/api/workspaces/remove":
+                return _handle_workspace_remove(handler, body)
+            if parsed.path == "/api/workspaces/create_project":
+                return _handle_workspace_create_project(handler, body)
+            if parsed.path == "/api/workspaces/rename":
+                return _handle_workspace_rename(handler, body)
+            return _handle_workspace_reorder(handler, body)
 
     # ── Approval (POST) ──
     if parsed.path == "/api/approval/respond":
@@ -32505,6 +32514,25 @@ def _handle_workspace_reorder(handler, body):
             pass
         reordered = []
         seen: set = set()  # path keys (legacy) or (path_key, project_id, kind) identities
+        # Deep-audit O1/O2: dedupe by the RESOLVED ROW OBJECT, not by key/identity
+        # set arithmetic. A legacy path-only entry and an identity entry at the
+        # same spelling may resolve to the SAME row (O1: double-append) or to
+        # DIFFERENT sibling rows (O2: the old key-granular safety net suppressed
+        # every row at a legacy key while only one was appended, silently
+        # deleting the sibling). Row identity is the only granularity that is
+        # correct for both.
+        added_rows: set = set()  # id() of appended wss rows; ("mat", x) for materialized rows
+
+        def _append_row(w, mat_key=None):
+            # wss rows dedupe by object identity; materialized rows are fresh
+            # dicts, so they dedupe by an explicit content key (a legacy string
+            # and an identity object that both materialize the same DB project
+            # must still yield ONE row).
+            tag = mat_key if mat_key is not None else id(w)
+            if tag not in added_rows:
+                added_rows.add(tag)
+                reordered.append(w)
+
         for item in paths:
             # Reorder entries are path strings (legacy picker) or identity
             # objects {path, workspace_kind, project_id} (round 3): the kind
@@ -32526,16 +32554,13 @@ def _handle_workspace_reorder(handler, body):
             # realpath matches (deep-audit 2c: profile-keyed db_by_path missed
             # these and the dragged position never persisted).
             host_key = _path_key(p)
-            # Dedupe by FULL identity, not path alone (round 3 must-fix 1): a
-            # remote row and a native project may share one spelling and are two
-            # persistable rows. Legacy path-only entries keep the old per-path
-            # first-wins rule (deep-audit P2: '/x/p' vs '/x/p/' spellings).
+            # Exact-identity dedupe: the same identity object twice in one
+            # payload is a no-op. Cross-granularity duplicates (legacy string vs
+            # identity object at one spelling) are handled by _append_row's
+            # row-object dedupe (O1/O2), which is the only granularity correct
+            # for both same-row and sibling-row cases.
             ident = (key, item_project_id, item_kind) if (item_project_id or item_kind) else key
-            if ident in seen or (item_project_id or item_kind) and key in seen and not item_project_id:
-                continue
-            if not (item_project_id or item_kind) and any(
-                s[0] == key for s in seen if isinstance(s, tuple)
-            ):
+            if ident in seen:
                 continue
             from api.projects_bridge import is_remote_workspace_path, lexical_key
 
@@ -32559,7 +32584,7 @@ def _handle_workspace_reorder(handler, body):
                     # Stale remote claim (row already removed): never
                     # materialize anything for it.
                     continue
-                reordered.append(local_hit)
+                _append_row(local_hit)
                 seen.add(ident)
                 continue
             if item_project_id:
@@ -32571,7 +32596,7 @@ def _handle_workspace_reorder(handler, body):
                 local_hit = next((w for w in wss if _at_key(w)
                                   and (w.get("project_mirror") or not _remote_literal(w))), None)
                 if local_hit is not None:
-                    reordered.append(local_hit)
+                    _append_row(local_hit)
                     seen.add(ident)
                     continue
                 # No local row: materialize EXACTLY the carried project id.
@@ -32586,12 +32611,12 @@ def _handle_workspace_reorder(handler, body):
                 if entry is None:
                     continue
                 row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
-                reordered.append(row)
+                _append_row(row, mat_key=("mat", id(entry)))
                 seen.add(ident)
                 continue
             local_hit = next((w for w in wss if _at_key(w)), None)
             if local_hit is not None:
-                reordered.append(local_hit)
+                _append_row(local_hit)
                 seen.add(ident)
             elif host_key in db_by_path or key in db_by_path:
                 # No local row: the dragged picker row came FROM projects.db
@@ -32613,35 +32638,16 @@ def _handle_workspace_reorder(handler, body):
                 # Materialized from the shared store -> mirror provenance, so a
                 # later archive hides exactly this row (must-fix 1 contract).
                 row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
-                reordered.append(row)
+                _append_row(row, mat_key=("mat", id(entry)))
                 seen.add(ident)
-        # Append any workspaces not mentioned (safety net). Suppression must use
-        # the SAME identity granularity as the main loop (greptile P1): a legacy
-        # path-only entry claims every row at its spelling (first-wins, deep-audit
-        # P2), but an identity entry claims ONLY the row it addresses — otherwise
-        # a stale tab dragging just the native row silently deleted a same-spelling
-        # remote row another tab had added.
-        from api.projects_bridge import is_remote_workspace_path as _is_remote_p
-
-        def _row_is_native(w):
-            # The row the native (project_id) claim addresses: a persisted mirror
-            # or a plain local row — never a remote literal (round 3 identity).
-            return bool(w.get("project_mirror")) or not _is_remote_p(
-                str(w.get("path", "")), profile=active_profile)
-
-        legacy_seen = {s for s in seen if not isinstance(s, tuple)}
-        identity_seen = {s for s in seen if isinstance(s, tuple)}
+        # Append any workspaces not mentioned (safety net). Coverage is the
+        # SAME row-object identity the main loop appended with (O1/O2): every
+        # wss row not already in `reordered` is preserved exactly once — no
+        # key-granular suppression that could drop a same-spelling sibling
+        # (O2) and no re-append of a row a differently-shaped entry already
+        # claimed (O1).
         for w in wss:
-            wkey = _path_key(w.get("path", ""), profile=active_profile)
-            if wkey in legacy_seen:
-                continue
-            covered = any(
-                s[0] == wkey and ((s[2] == "remote" and not _row_is_native(w))
-                                  or (s[1] and _row_is_native(w)))
-                for s in identity_seen
-            )
-            if not covered:
-                reordered.append(w)
+            _append_row(w)
         try:
             save_workspaces(reordered, profile=active_profile)
         except TypeError:

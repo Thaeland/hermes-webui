@@ -235,9 +235,13 @@ def test_reorder_native_identity_keeps_unmentioned_remote_sibling(remote_profile
         f"unmentioned remote row must survive: {state['wss']}"
 
 
-def test_reorder_legacy_path_still_suppresses_all_rows_at_spelling(remote_profile):
-    """Legacy path-only entries keep the old per-path first-wins rule
-    (deep-audit P2): a path-only entry claims EVERY row at the spelling."""
+def test_reorder_legacy_path_keeps_all_rows_at_spelling(remote_profile):
+    """Superseded by deep-audit round 5 (O2): the old per-path first-wins
+    suppression silently DELETED same-spelling sibling rows on an
+    all-strings payload (a 200 that destroyed picker state). A legacy
+    path-only entry cannot disambiguate which sibling it means, so it must
+    claim only the first row's position and every row at that spelling
+    persists (safety net preserves the sibling)."""
     from api.routes import _handle_workspace_reorder
 
     same = remote_profile["same"]
@@ -252,8 +256,11 @@ def test_reorder_legacy_path_still_suppresses_all_rows_at_spelling(remote_profil
                side_effect=lambda w, profile=None: state.__setitem__("wss", [dict(x) for x in w])):
         _handle_workspace_reorder(h, {"paths": [same]})
     assert h.send_response.call_args[0][0] == 200, _response(h)
-    assert len([w for w in state["wss"] if w["path"] == same]) == 1, \
-        f"legacy path entry keeps first-wins per path: {state['wss']}"
+    same_rows = [w for w in state["wss"] if w["path"] == same]
+    assert len(same_rows) == 2, \
+        f"legacy path entry must not delete same-spelling siblings: {state['wss']}"
+    assert same_rows[0]["name"] == "RemoteWWW", \
+        f"first-wins position preserved: {state['wss']}"
 
 
 # ── Finding 3 (P2): remote rename response must be the MERGED view ──────────

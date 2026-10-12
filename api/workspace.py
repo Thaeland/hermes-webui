@@ -32,6 +32,12 @@ _ESCAPE_AUTH_TTL_SECONDS = 300
 _ESCAPE_AUTH_LOCK = threading.Lock()
 _ESCAPE_AUTH_TOKENS: dict[str, dict[str, str | int | float]] = {}
 
+# Serializes the load→mutate→save cycle of every workspace mutation route
+# (add/remove/create_project/rename/reorder). See _handle_workspace_* in
+# api/routes.py (deep-audit F3): the projects.db bridge widened the
+# read-modify-write window enough for a concurrent mutation to be lost.
+WORKSPACE_MUTATION_LOCK = threading.RLock()
+
 from api.config import (
     WORKSPACES_FILE as _GLOBAL_WS_FILE,
     LAST_WORKSPACE_FILE as _GLOBAL_LW_FILE,
@@ -612,7 +618,17 @@ def save_workspaces(workspaces: list, profile: str | Path | None = None) -> None
         # (it would land in the default profile's directory via the old clamp).
         raise ValueError(f"cannot save workspaces for invalid profile {profile!r}")
     ws_file.parent.mkdir(parents=True, exist_ok=True)
-    ws_file.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding='utf-8')
+    # Atomic replace (deep-audit F3): a concurrent reader (or a crash
+    # mid-write) must never observe a torn workspaces.json — a truncated
+    # file makes load_workspaces fall back to [Home] and the next mutation
+    # would persist that fallback, wiping the picker list.
+    tmp = ws_file.with_name(ws_file.name + f".tmp-{os.getpid()}-{threading.get_ident()}")
+    try:
+        tmp.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, ws_file)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 def get_profile_default_workspace(profile: str | Path | None = None) -> str:

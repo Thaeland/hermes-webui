@@ -645,6 +645,7 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
 _ARCHIVE_PROJECT_PROG = """
 import json, os, sys
 db_path, match_mode, match_value, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+match_path = sys.argv[5] if len(sys.argv) > 5 else None
 sys.path.insert(0, agent_dir)
 def _key(p):
     try:
@@ -669,6 +670,19 @@ try:
                 "SELECT id FROM projects WHERE id = ? AND archived = 0", (match_value,)
             ).fetchone()
             matches = [row[0]] if row else []
+            # F4 (mirrors the in-process lane): the id must ALSO own the
+            # requested path; a mismatched pair is stale/crafted input.
+            if matches and match_path is not None:
+                _p = conn.execute(
+                    "SELECT primary_path FROM projects WHERE id = ?", (match_value,)
+                ).fetchone()
+                _primary = _p[0] if _p and _p[0] else conn.execute(
+                    "SELECT path FROM project_folders WHERE project_id = ? "
+                    "ORDER BY is_primary DESC, added_at ASC LIMIT 1", (match_value,)
+                ).fetchone()
+                _primary = _primary[0] if isinstance(_primary, tuple) else None
+                if not _primary or _key(_primary) != _key(match_path):
+                    matches = []
         else:
             key = _key(match_value)
             matches = []
@@ -693,6 +707,35 @@ try:
 except Exception as e:
     print(json.dumps({"ok": False, "error": str(e)}))
 """
+
+
+def _primary_of(proj):
+    """A project's primary path: explicit column, else primary folder, else
+    first folder (same traversal as _find_projects_by_path)."""
+    return proj.primary_path or next(
+        (f.path for f in proj.folders if f.is_primary),
+        proj.folders[0].path if proj.folders else None,
+    )
+
+
+def _id_project_matches_path(pdb, conn, project_id: str, path: str) -> bool:
+    """True iff the non-archived project ``project_id`` exists AND its primary
+    path canonicalizes to ``path`` (deep-audit F4).
+
+    The id lane trusts the client-carried ``project_id`` to select the DB
+    target; without this cross-check a crafted or stale POST pairing an
+    unrelated ``path`` with a victim ``project_id`` would archive/rename the
+    victim. The picker never emits mismatched pairs, so a mismatch means
+    stale/foreign input: fail closed (caller treats False as not-found).
+    Canonicalization matches ``_find_projects_by_path`` (realpath both sides),
+    so a symlinked or tilde spelling of the same directory still passes.
+    """
+    target = path_key(path)
+    for proj in pdb.list_projects(conn, include_archived=False):
+        if str(proj.id) == str(project_id):
+            primary = _primary_of(proj)
+            return bool(primary) and path_key(primary) == target
+    return False
 
 
 def _find_projects_by_path(pdb, conn, path: str):
@@ -757,6 +800,11 @@ def archive_hermes_project(path: str, profile_home: Path | None = None,
                 # pdb.archive_project) because write_txn cannot nest.
                 with pdb.write_txn(conn):
                     if project_id:
+                        # F4: the id must ALSO own the requested path — a
+                        # mismatched (path, project_id) pair is stale or
+                        # crafted input and must not touch the victim project.
+                        if not _id_project_matches_path(pdb, conn, project_id, path):
+                            return {"archived": False, "reason": "not-found"}
                         row = conn.execute(
                             "SELECT id FROM projects WHERE id = ? AND archived = 0",
                             (str(project_id),),
@@ -797,7 +845,8 @@ def archive_hermes_project(path: str, profile_home: Path | None = None,
     try:
         proc = subprocess.run(
             [sys.executable, "-I", "-c", _ARCHIVE_PROJECT_PROG, str(db),
-             "id" if project_id else "path", str(project_id or resolved), str(agent_dir)],
+             "id" if project_id else "path", str(project_id or resolved), str(agent_dir),
+             str(path)],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -828,6 +877,7 @@ def archive_hermes_project(path: str, profile_home: Path | None = None,
 _RENAME_PROJECT_PROG = """
 import json, os, sys
 db_path, match_mode, match_value, name, agent_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+match_path = sys.argv[6] if len(sys.argv) > 6 else None
 sys.path.insert(0, agent_dir)
 def _key(p):
     try:
@@ -848,6 +898,19 @@ try:
                 "SELECT id FROM projects WHERE id = ? AND archived = 0", (match_value,)
             ).fetchone()
             matches = [row[0]] if row else []
+            # F4 (mirrors the in-process lane): the id must ALSO own the
+            # requested path; a mismatched pair is stale/crafted input.
+            if matches and match_path is not None:
+                _p = conn.execute(
+                    "SELECT primary_path FROM projects WHERE id = ?", (match_value,)
+                ).fetchone()
+                _primary = _p[0] if _p and _p[0] else conn.execute(
+                    "SELECT path FROM project_folders WHERE project_id = ? "
+                    "ORDER BY is_primary DESC, added_at ASC LIMIT 1", (match_value,)
+                ).fetchone()
+                _primary = _primary[0] if isinstance(_primary, tuple) else None
+                if not _primary or _key(_primary) != _key(match_path):
+                    matches = []
         else:
             key = _key(match_value)
             matches = []
@@ -906,6 +969,9 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
                 # name branch because write_txn cannot nest.
                 with pdb.write_txn(conn):
                     if project_id:
+                        # F4: id must own the requested path — see archive.
+                        if not _id_project_matches_path(pdb, conn, project_id, path):
+                            return {"renamed": False, "reason": "not-found"}
                         row = conn.execute(
                             "SELECT id FROM projects WHERE id = ? AND archived = 0",
                             (str(project_id),),
@@ -941,7 +1007,8 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     try:
         proc = subprocess.run(
             [sys.executable, "-I", "-c", _RENAME_PROJECT_PROG, str(db),
-             "id" if project_id else "path", str(project_id or resolved), name, str(agent_dir)],
+             "id" if project_id else "path", str(project_id or resolved), name, str(agent_dir),
+             str(path)],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
