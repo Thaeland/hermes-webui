@@ -72,8 +72,8 @@ def _is_remote_workspace_path(path: str, profile: str | Path | None = None) -> b
     how the row was stored in the first place.
     """
     try:
-        from api.workspace import _remote_terminal_workspace_candidate
-        return _remote_terminal_workspace_candidate(path, profile=profile) is not None
+        from api.workspace import cached_remote_workspace_candidate
+        return cached_remote_workspace_candidate(path, profile=profile) is not None
     except Exception:
         return False
 
@@ -346,8 +346,13 @@ def merge_hermes_projects(workspaces: list[dict], profile_home: Path | None = No
     # read + blocked-root tables): the merge asks "is this row remote?" for
     # every picker row with the SAME profile argument. Fresh memo per merge
     # call — see workspace_call_scope for why it is never process-lifetime.
-    from api.workspace import workspace_call_scope
+    from api.workspace import workspace_call_scope, _WORKSPACE_CALL_SCOPE
+    parent_memo = _WORKSPACE_CALL_SCOPE.get()
     with workspace_call_scope():
+        # Nested empty scope would drop a GET-level memo. Copy parent keys
+        # in; restore on exit still isolates this call from the next request.
+        if parent_memo is not None:
+            _WORKSPACE_CALL_SCOPE.get().update(parent_memo)
         return _merge_hermes_projects_inner(workspaces, profile_home=profile_home, profile=profile)
 
 
@@ -397,16 +402,11 @@ def _merge_hermes_projects_inner(workspaces: list[dict], profile_home: Path | No
         entry = _stamp_remote_kind(w, profile)
         path = entry.get("path", "")
         remote_literal_row = entry.get("workspace_kind") == "remote"
-        # Row<->DB keying (re-gate must-fix, supersedes the blanket host-key
-        # walk-back of 7c990429): projects.db is host-local, so genuine
-        # local/native rows key the HOST form — a local row spelled under a
-        # remote terminal.cwd that is actually host-owned (or a persisted
-        # mirror created FROM the shared store) matches its DB project by
-        # realpath (deep-audit 2a/2b). But a REMOTE literal keys lexically: a
-        # host symlink at the same spelling must not replace the remote alias
-        # label with an unrelated host project's name.
-        key = row_db_key(path, profile=profile,
-                         native_provenance=bool(entry.get("project_mirror")))
+        # Reuse the stamp: ``row_db_key`` would re-enter the remoteness
+        # probe (and ``path_key(..., profile=)`` would do it again). A
+        # remote literal keys lexically; native/host rows keep the host
+        # realpath key. Equivalent to ``row_db_key`` after stamp.
+        key = lexical_key(path) if remote_literal_row else path_key(path)
         if entry.get("project_mirror") and archived.get(key) is not None and db_by_path.get(key) is None:
             # Persisted mirror of a retired shared project: hide it. Rows
             # without the provenance flag are ordinary local workspaces and
