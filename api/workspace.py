@@ -291,10 +291,11 @@ def workspace_call_scope():
     """Enable the call-scoped memo for one hot-loop invocation.
 
     Wrap a loop that repeats the same profile-level probes (remote terminal
-    cwd, blocked system roots) over many rows — currently
-    ``projects_bridge.merge_hermes_projects``. Outside the scope every probe
-    runs fresh, exactly like pre-scope behavior. Nested use restores the
-    outer memo on exit.
+    cwd, blocked system roots, full per-path remoteness) over many rows.
+    ``GET /api/workspaces`` holds one scope around ``load_workspaces`` +
+    ``merge_hermes_projects`` so the two loops share the memo. Merge copies
+    any parent memo into its nested scope instead of wiping it. Outside the
+    scope every probe runs fresh. Nested use restores the outer memo on exit.
     """
     token = _WORKSPACE_CALL_SCOPE.set({})
     try:
@@ -419,7 +420,18 @@ def _remote_terminal_cwd(profile: str | Path | None = None) -> str | None:
         return None
 
 
+def cached_remote_workspace_candidate(path, profile=None):
+    # Cache complete classification only for the active call/request.
+    key = ("remote_candidate", type(profile), profile, str(path))
+    return _call_scoped_memo(key, lambda: _remote_terminal_workspace_candidate(path, profile=profile))
+
+
 def _remote_terminal_workspace_candidate(path: str | Path, profile: str | Path | None = None) -> Path | None:
+    key = ("remote_candidate", type(profile), profile, str(path))
+    return _call_scoped_memo(key, lambda: _remote_terminal_workspace_candidate_uncached(path, profile=profile))
+
+
+def _remote_terminal_workspace_candidate_uncached(path: str | Path, profile: str | Path | None = None) -> Path | None:
     """Return a non-stat'ed target-side Path when it is under terminal.cwd for the given profile.
 
     Remote workspace paths live on the target host (e.g., remote SSH/Docker
@@ -567,10 +579,16 @@ def _clean_workspace_list(workspaces: list, profile: str | Path | None = None) -
         # can hide exactly the rows whose shared project was archived —
         # without that flag a plain local re-add at an archived project's
         # path would be hidden and then refused as a duplicate (re-gate
-        # must-fix 1). Any other extra keys are still dropped on purpose.
+        # must-fix 1). Keep the native id too: fallback merge (unreadable
+        # DB / kill switch) cannot re-stamp it from the store, and dropping
+        # it here makes the picker emit path-only actions against a
+        # successor at the same spelling (greptile P1).
         entry = {'path': str(p), 'name': name}
         if w.get('project_mirror'):
             entry['project_mirror'] = True
+        pid = str(w.get('project_id') or '').strip()
+        if pid:
+            entry['project_id'] = pid
         result.append(entry)
     return result
 

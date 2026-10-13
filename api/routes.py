@@ -17262,32 +17262,34 @@ def handle_get(handler, parsed) -> bool:
         return _handle_session_export(handler, parsed)
 
     if parsed.path == "/api/workspaces":
-        from api.profiles import get_active_profile_name
-        active_profile = get_active_profile_name()
-        try:
-            wss = load_workspaces(profile=active_profile)
-        except TypeError:
-            wss = load_workspaces()
-        # #5763 read slice: surface the profile's authoritative Hermes Projects
-        # store (projects.db) in the picker. Fail-safe: no DB / error => the
-        # local workspaces.json list unchanged.
-        try:
-            from api.projects_bridge import merge_hermes_projects
-            wss = merge_hermes_projects(wss, profile=active_profile)
-        except Exception:
-            logger.debug("projects.db workspace merge skipped", exc_info=True)
-        try:
-            lw = get_last_workspace(profile=active_profile)
-        except TypeError:
-            lw = get_last_workspace()
-        return j(
-            handler,
-            {
-                "workspaces": wss,
-                "last": lw,
-                "terminal_remote_backend": _terminal_remote_backend_enabled(),
-            },
-        )
+        from api.workspace import workspace_call_scope
+        with workspace_call_scope():
+            from api.profiles import get_active_profile_name
+            active_profile = get_active_profile_name()
+            try:
+                wss = load_workspaces(profile=active_profile)
+            except TypeError:
+                wss = load_workspaces()
+            # #5763 read slice: surface the profile's authoritative Hermes Projects
+            # store (projects.db) in the picker. Fail-safe: no DB / error => the
+            # local workspaces.json list unchanged.
+            try:
+                from api.projects_bridge import merge_hermes_projects
+                wss = merge_hermes_projects(wss, profile=active_profile)
+            except Exception:
+                logger.debug("projects.db workspace merge skipped", exc_info=True)
+            try:
+                lw = get_last_workspace(profile=active_profile)
+            except TypeError:
+                lw = get_last_workspace()
+            return j(
+                handler,
+                {
+                    "workspaces": wss,
+                    "last": lw,
+                    "terminal_remote_backend": _terminal_remote_backend_enabled(),
+                },
+            )
 
     if parsed.path == "/api/workspaces/suggest":
         from api.profiles import get_active_profile_name
@@ -32084,6 +32086,9 @@ def _handle_workspace_create_project(handler, body):
         row = {"path": str(p), "name": project_name}
         if registered:
             row["project_mirror"] = True
+            pid = str(project.get("id") or "").strip()
+            if pid:
+                row["project_id"] = pid
         wss.append(row)
         try:
             save_workspaces(wss, profile=active_profile)
@@ -32094,6 +32099,9 @@ def _handle_workspace_create_project(handler, body):
         # the existing row too, or a later archive leaves an un-hidable
         # mirror (deep-audit finding 1).
         existing_row["project_mirror"] = True
+        pid = str(project.get("id") or "").strip()
+        if pid:
+            existing_row["project_id"] = pid
         try:
             save_workspaces(wss, profile=active_profile)
         except TypeError:
@@ -32677,7 +32685,8 @@ def _handle_workspace_reorder(handler, body):
                 )
                 if entry is None:
                     continue
-                row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
+                row = {"path": entry["path"], "name": entry["name"], "project_mirror": True,
+                       "project_id": item_project_id}
                 _append_row(row, mat_key=("mat", id(entry)))
                 seen.add(ident)
                 continue
@@ -32705,6 +32714,9 @@ def _handle_workspace_reorder(handler, body):
                 # Materialized from the shared store -> mirror provenance, so a
                 # later archive hides exactly this row (must-fix 1 contract).
                 row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
+                pid = str(entry.get("project_id") or "").strip()
+                if pid:
+                    row["project_id"] = pid
                 _append_row(row, mat_key=("mat", id(entry)))
                 seen.add(ident)
         # Append any workspaces not mentioned (safety net). Coverage is the
