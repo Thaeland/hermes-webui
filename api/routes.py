@@ -32086,9 +32086,6 @@ def _handle_workspace_create_project(handler, body):
         row = {"path": str(p), "name": project_name}
         if registered:
             row["project_mirror"] = True
-            pid = str(project.get("id") or "").strip()
-            if pid:
-                row["project_id"] = pid
         wss.append(row)
         try:
             save_workspaces(wss, profile=active_profile)
@@ -32099,9 +32096,6 @@ def _handle_workspace_create_project(handler, body):
         # the existing row too, or a later archive leaves an un-hidable
         # mirror (deep-audit finding 1).
         existing_row["project_mirror"] = True
-        pid = str(project.get("id") or "").strip()
-        if pid:
-            existing_row["project_id"] = pid
         try:
             save_workspaces(wss, profile=active_profile)
         except TypeError:
@@ -32685,8 +32679,7 @@ def _handle_workspace_reorder(handler, body):
                 )
                 if entry is None:
                     continue
-                row = {"path": entry["path"], "name": entry["name"], "project_mirror": True,
-                       "project_id": item_project_id}
+                row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
                 _append_row(row, mat_key=("mat", id(entry)))
                 seen.add(ident)
                 continue
@@ -32714,9 +32707,6 @@ def _handle_workspace_reorder(handler, body):
                 # Materialized from the shared store -> mirror provenance, so a
                 # later archive hides exactly this row (must-fix 1 contract).
                 row = {"path": entry["path"], "name": entry["name"], "project_mirror": True}
-                pid = str(entry.get("project_id") or "").strip()
-                if pid:
-                    row["project_id"] = pid
                 _append_row(row, mat_key=("mat", id(entry)))
                 seen.add(ident)
         # Append any workspaces not mentioned (safety net). Coverage is the
