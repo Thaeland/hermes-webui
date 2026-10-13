@@ -579,16 +579,10 @@ def _clean_workspace_list(workspaces: list, profile: str | Path | None = None) -
         # can hide exactly the rows whose shared project was archived —
         # without that flag a plain local re-add at an archived project's
         # path would be hidden and then refused as a duplicate (re-gate
-        # must-fix 1). Keep the native id too: fallback merge (unreadable
-        # DB / kill switch) cannot re-stamp it from the store, and dropping
-        # it here makes the picker emit path-only actions against a
-        # successor at the same spelling (greptile P1).
+        # must-fix 1). Any other extra keys are still dropped on purpose.
         entry = {'path': str(p), 'name': name}
         if w.get('project_mirror'):
             entry['project_mirror'] = True
-        pid = str(w.get('project_id') or '').strip()
-        if pid:
-            entry['project_id'] = pid
         result.append(entry)
     return result
 
