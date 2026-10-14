@@ -32269,7 +32269,18 @@ def _handle_workspace_remove(handler, body):
                           "Project) or workspace_kind (remote workspace) to remove it."),
                 "code": "ambiguous_target",
             }, status=409)
-        if local_row is not None:
+        # Sibling pair at one spelling (mirror row + remote literal): remote
+        # literals ALWAYS carry workspace_kind=remote in every projection, so an
+        # identity-free request can only have come from the mirror row. Target
+        # the mirror; keep the remote sibling (greptile P1 on 0bf8feb8).
+        _mirror_at_key = any(_same_path(w.get("path", ""), path_str) and w.get("project_mirror") for w in wss)
+        _remote_at_key = any(_same_path(w.get("path", ""), path_str) and not w.get("project_mirror")
+                             and is_remote_workspace_path(str(w.get("path", "")), profile=active_profile)
+                             for w in wss)
+        _sibling_pair = local_row is not None and _mirror_at_key and _remote_at_key
+        if _sibling_pair:
+            remote_literal = False
+        elif local_row is not None:
             remote_literal = remote_spelled and not local_row.get("project_mirror")
         else:
             remote_literal = False
@@ -32289,7 +32300,13 @@ def _handle_workspace_remove(handler, body):
                     "Could not archive the shared Hermes Project (projects writer unavailable); "
                     "workspace left unchanged.",
                 )
-        wss = [w for w in wss if not _same_path(w["path"], path_str)]
+        if _sibling_pair:
+            wss = [w for w in wss if not (_same_path(w["path"], path_str)
+                                          and (w.get("project_mirror")
+                                               or not is_remote_workspace_path(str(w.get("path", "")),
+                                                                               profile=active_profile)))]
+        else:
+            wss = [w for w in wss if not _same_path(w["path"], path_str)]
         try:
             save_workspaces(wss, profile=active_profile)
         except TypeError:
@@ -32334,6 +32351,16 @@ def _handle_workspace_rename(handler, body):
         target_key = _path_key(path_str, profile=active_profile)
         local_hit = next((w for w in wss
                           if _path_key(w.get("path", ""), profile=active_profile) == target_key), None)
+        # Sibling pair at one spelling (mirror + remote literal): a path-only
+        # request can only come from the mirror row (remote literals always
+        # carry workspace_kind=remote) — never rename the remote sibling.
+        if local_hit is not None and not local_hit.get("project_mirror"):
+            from api.projects_bridge import is_remote_workspace_path as _is_remote_ws_sib
+            _mirror_hit = next((w for w in wss
+                                if _path_key(w.get("path", ""), profile=active_profile) == target_key
+                                and w.get("project_mirror")), None)
+            if _mirror_hit is not None and _is_remote_ws_sib(str(local_hit.get("path", "")), profile=active_profile):
+                local_hit = _mirror_hit
 
         def _rename_local_and_respond(only_mirror=None):
             # only_mirror=None: legacy — rename every row at the spelling.
@@ -32487,7 +32514,7 @@ def _handle_workspace_rename(handler, body):
             _db_lexical = {lexical_key(e["path"]) for e in _entries if e.get("path")}
         except Exception:
             _db_lexical = set()
-        local_row = next((w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == target_key), None)
+        local_row = local_hit  # same lookup, sibling-aware (see above)
         if local_row is not None:
             remote_literal = remote_spelled and not local_row.get("project_mirror")
         else:
@@ -32683,7 +32710,15 @@ def _handle_workspace_reorder(handler, body):
                 _append_row(row, mat_key=("mat", id(entry)))
                 seen.add(ident)
                 continue
-            local_hit = next((w for w in wss if _at_key(w)), None)
+            # Identity object without kind/id (current picker, mirror row under
+            # the kill switch): prefer the mirror/host row over a remote-literal
+            # sibling at the same spelling — the remote row always sends its
+            # kind. A bare legacy string keeps first-wins (round-5 O2 pin).
+            local_hit = None
+            if isinstance(item, dict):
+                local_hit = next((w for w in wss if _at_key(w) and not _remote_literal(w)), None)
+            if local_hit is None:
+                local_hit = next((w for w in wss if _at_key(w)), None)
             if local_hit is not None:
                 _append_row(local_hit)
                 seen.add(ident)
