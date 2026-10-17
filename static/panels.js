@@ -6353,7 +6353,12 @@ function _clearWorkspaceDetail(){
 
 async function activateCurrentWorkspace(){
   if (!_currentWorkspaceDetail) return;
+  // Round 11 sibling (omp review): the switch request can outlive the detail
+  // view; a late continuation must not re-render the old detail over a form
+  // the user opened meanwhile (same _workspaceUiGen guard as saveWorkspaceForm).
+  const gen = _workspaceUiGen;
   await switchToWorkspace(_currentWorkspaceDetail.path, _currentWorkspaceDetail.name);
+  if (gen !== _workspaceUiGen) return;
   // Re-render detail after activation so the active badge updates
   _renderWorkspaceDetail(_currentWorkspaceDetail);
 }
@@ -6373,7 +6378,12 @@ async function deleteCurrentWorkspace(){
     const body={path};
     if(target.workspace_kind) body.workspace_kind=target.workspace_kind;
     if(target.project_id) body.project_id=target.project_id;
+    // Round 11 sibling (omp review): a late remove response must not overwrite
+    // _workspaceList with its pre-interruption snapshot (a newer list would
+    // vanish) nor re-render over a form the user opened meanwhile.
+    const gen = _workspaceUiGen;
     const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify(body)});
+    if (gen !== _workspaceUiGen) return;
     _workspaceList=data.workspaces;
     const cd=_currentWorkspaceDetail;
     // Only clear the detail if it still shows the removed row.
@@ -6503,7 +6513,12 @@ async function saveWorkspaceForm(){
     const asProjectEl = $('workspaceFormAsProject');
     const asProject = asProjectEl ? asProjectEl.checked : false;
     if (asProject) {
+      // Greptile P2 (round 11): the create request can wait seconds on the
+      // subprocess lane; reject a late response once the user has left this
+      // form (same _workspaceUiGen guard the rename branch uses).
+      const gen = _workspaceUiGen;
       const data = await api('/api/workspaces/create_project', { method:'POST', body: JSON.stringify({ path, name, create: true }) });
+      if (gen !== _workspaceUiGen) return;
       _workspaceList = data.workspaces || [];
       _workspacePreFormDetail = null;
       renderWorkspacesPanel(_workspaceList);
@@ -6519,7 +6534,10 @@ async function saveWorkspaceForm(){
     }
     const addBody = { path };
     if (name) addBody.name = name;
+    // Same stale-response guard as the create_project branch above.
+    const addGen = _workspaceUiGen;
     const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify(addBody) });
+    if (addGen !== _workspaceUiGen) return;
     _workspaceList = data.workspaces || [];
     _workspacePreFormDetail = null;
     renderWorkspacesPanel(_workspaceList);

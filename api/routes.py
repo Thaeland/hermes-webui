@@ -30140,35 +30140,44 @@ def _handle_workspace_create_project(handler, body):
     # must-fix 1).
     from api.projects_bridge import merge_hermes_projects, path_key as _path_key
     registered = "error" not in project
-    try:
-        wss = load_workspaces(profile=active_profile)
-    except TypeError:
-        wss = load_workspaces()
-    new_key = _path_key(str(p), profile=active_profile)
-    existing_row = next(
-        (w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == new_key), None)
-    if existing_row is None:
-        # OCR medium: only stamp mirror provenance when the DB registration
-        # actually succeeded — a rejected registration (e.g. path owned by an
-        # ARCHIVED project) must not produce a mirror row that the merge then
-        # hides, recreating the invisible-row class of must-fix 1.
-        row = {"path": str(p), "name": project_name}
-        if registered:
-            row["project_mirror"] = True
-        wss.append(row)
+    # Greptile P1 (round 11): /api/projects/bind rewrites workspaces.json
+    # under _PROJECTS_CATALOG_LOCK (its auto-registration lane,
+    # _resolve_ws_list) without taking WORKSPACE_MUTATION_LOCK. This
+    # handler's load→modify→save must serialize on the same lock or a
+    # concurrent bind registration is last-writer-wins erased. Scope is the
+    # LOCAL block only — the subprocess project-create above must not hold
+    # the catalog lock. Lock order matches remove/rename/reorder:
+    # WORKSPACE_MUTATION_LOCK (dispatcher) → _PROJECTS_CATALOG_LOCK (here).
+    with _PROJECTS_CATALOG_LOCK:
         try:
-            save_workspaces(wss, profile=active_profile)
+            wss = load_workspaces(profile=active_profile)
         except TypeError:
-            save_workspaces(wss)
-    elif registered and not existing_row.get("project_mirror"):
-        # Plain local row promoted to a shared project: stamp provenance on
-        # the existing row too, or a later archive leaves an un-hidable
-        # mirror (deep-audit finding 1).
-        existing_row["project_mirror"] = True
-        try:
-            save_workspaces(wss, profile=active_profile)
-        except TypeError:
-            save_workspaces(wss)
+            wss = load_workspaces()
+        new_key = _path_key(str(p), profile=active_profile)
+        existing_row = next(
+            (w for w in wss if _path_key(w.get("path", ""), profile=active_profile) == new_key), None)
+        if existing_row is None:
+            # OCR medium: only stamp mirror provenance when the DB registration
+            # actually succeeded — a rejected registration (e.g. path owned by an
+            # ARCHIVED project) must not produce a mirror row that the merge then
+            # hides, recreating the invisible-row class of must-fix 1.
+            row = {"path": str(p), "name": project_name}
+            if registered:
+                row["project_mirror"] = True
+            wss.append(row)
+            try:
+                save_workspaces(wss, profile=active_profile)
+            except TypeError:
+                save_workspaces(wss)
+        elif registered and not existing_row.get("project_mirror"):
+            # Plain local row promoted to a shared project: stamp provenance on
+            # the existing row too, or a later archive leaves an un-hidable
+            # mirror (deep-audit finding 1).
+            existing_row["project_mirror"] = True
+            try:
+                save_workspaces(wss, profile=active_profile)
+            except TypeError:
+                save_workspaces(wss)
     try:
         merged = merge_hermes_projects(load_workspaces(profile=active_profile), profile=active_profile)
     except Exception:
