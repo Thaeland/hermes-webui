@@ -17265,19 +17265,37 @@ def handle_get(handler, parsed) -> bool:
         from api.workspace import workspace_call_scope
         with workspace_call_scope():
             from api.profiles import get_active_profile_name
+            from api.workspace import catalog_boot, catalog_revision
             active_profile = get_active_profile_name()
-            try:
-                wss = load_workspaces(profile=active_profile)
-            except TypeError:
-                wss = load_workspaces()
-            # #5763 read slice: surface the profile's authoritative Hermes Projects
-            # store (projects.db) in the picker. Fail-safe: no DB / error => the
-            # local workspaces.json list unchanged.
-            try:
-                from api.projects_bridge import merge_hermes_projects
-                wss = merge_hermes_projects(wss, profile=active_profile)
-            except Exception:
-                logger.debug("projects.db workspace merge skipped", exc_info=True)
+            # #5763 round 14 (omp review F1): seqlock read — re-snapshot while
+            # the revision moved during the read. On give-up (3 consecutive
+            # moves) stamp the LAST rev_before, a sound LOWER bound on the
+            # snapshot: the bump to N happens after commit N's os.replace, so
+            # reading rev=N before the load guarantees the load sees every
+            # commit <= N. Stamping the latest rev would overstate freshness
+            # and gate-reject the in-flight commits whose rows the snapshot
+            # lacks (omp r14 P2-1). Under-stamping is harmless: the client
+            # accepts equal-rev responses, and the next GET reconciles.
+            for _attempt in range(3):
+                rev_before = catalog_revision()
+                try:
+                    wss = load_workspaces(profile=active_profile)
+                except TypeError:
+                    wss = load_workspaces()
+                # #5763 read slice: surface the profile's authoritative Hermes Projects
+                # store (projects.db) in the picker. Fail-safe: no DB / error => the
+                # local workspaces.json list unchanged.
+                try:
+                    from api.projects_bridge import merge_hermes_projects
+                    wss = merge_hermes_projects(wss, profile=active_profile)
+                except Exception:
+                    logger.debug("projects.db workspace merge skipped", exc_info=True)
+                rev_after = catalog_revision()
+                if rev_after == rev_before:
+                    rev = rev_after
+                    break
+            else:
+                rev = rev_before
             try:
                 lw = get_last_workspace(profile=active_profile)
             except TypeError:
@@ -17286,6 +17304,9 @@ def handle_get(handler, parsed) -> bool:
                 handler,
                 {
                     "workspaces": wss,
+                    "rev": rev,
+                    "boot": catalog_boot(),
+                    "profile": active_profile,
                     "last": lw,
                     "terminal_remote_backend": _terminal_remote_backend_enabled(),
                 },
@@ -31886,6 +31907,31 @@ def _handle_file_open_vscode(handler, body):
         return bad(handler, _sanitize_error(e))
 
 
+def _ws_catalog_rev() -> int:
+    # #5763 round 14 (omp review F1): mutation responses carry the catalog
+    # revision of their own commit (read under WORKSPACE_MUTATION_LOCK by the
+    # dispatcher) so the client can order snapshots by server commit, not by
+    # client send time.
+    from api.workspace import catalog_revision
+    return catalog_revision()
+
+
+def _ws_catalog_boot() -> str:
+    # r14 P1-1: per-process boot token so a restart (rev counter resets to 0)
+    # resets the client gate instead of freezing the picker.
+    from api.workspace import catalog_boot
+    return catalog_boot()
+
+
+def _ws_catalog_profile() -> str:
+    # r15 P2: the rev counter is process-global, so after a profile switch a
+    # stale old-profile mutation response is always rev-acceptable. Mutation
+    # payloads echo the profile they served (like the GET) so the client can
+    # drop cross-profile stragglers.
+    from api.profiles import get_active_profile_name
+    return get_active_profile_name()
+
+
 def _handle_workspace_add(handler, body):
     # Strip surrounding paired quotes BEFORE any further processing — macOS
     # Finder's "Copy as Pathname" wraps paths in single quotes, and users
@@ -31996,7 +32042,7 @@ def _handle_workspace_add(handler, body):
         # "path" is the server-normalized form: callers match the added row on it
         # because the user may have typed '~/x' or a trailing slash, which never
         # equals the stored row (same contract as create_project's project.path).
-        return j(handler, {"ok": True, "path": str(p), "workspaces": merged})
+        return j(handler, {"ok": True, "path": str(p), "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
 def _handle_workspace_create_project(handler, body):
     """Create a Hermes Project (projects.db) AND a WebUI workspace in one step.
@@ -32113,7 +32159,7 @@ def _handle_workspace_create_project(handler, body):
         merged = merge_hermes_projects(load_workspaces(profile=active_profile), profile=active_profile)
     except Exception:
         merged = wss
-    return j(handler, {"ok": True, "project": project, "workspaces": merged})
+    return j(handler, {"ok": True, "project": project, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
 
 def _handle_workspace_remove(handler, body):
@@ -32230,7 +32276,7 @@ def _handle_workspace_remove(handler, body):
                 merged = merge_hermes_projects(remaining, profile=active_profile)
             except Exception:
                 merged = remaining
-            return j(handler, {"ok": True, "workspaces": merged})
+            return j(handler, {"ok": True, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
         if req_kind == "remote":
             # Explicit remote-target claim: remove ONLY the saved local row.
@@ -32339,7 +32385,7 @@ def _handle_workspace_remove(handler, body):
             merged = merge_hermes_projects(wss, profile=active_profile)
         except Exception:
             merged = wss
-        return j(handler, {"ok": True, "workspaces": merged})
+        return j(handler, {"ok": True, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
 def _handle_workspace_rename(handler, body):
     path_str = body.get("path", "").strip()
@@ -32389,7 +32435,7 @@ def _handle_workspace_rename(handler, body):
                 merged = merge_hermes_projects(wss, profile=active_profile)
             except Exception:
                 merged = wss
-            return j(handler, {"ok": True, "workspaces": merged})
+            return j(handler, {"ok": True, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
         if req_kind == "remote":
             # Explicit remote-target claim: rename ONLY the saved local row,
@@ -32429,7 +32475,7 @@ def _handle_workspace_rename(handler, body):
                 merged = merge_hermes_projects(load_workspaces())
             except Exception:
                 merged = wss
-            return j(handler, {"ok": True, "workspaces": merged})
+            return j(handler, {"ok": True, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
         if local_hit is not None:
             local_hit["name"] = name
@@ -32493,7 +32539,7 @@ def _handle_workspace_rename(handler, body):
                 merged = merge_hermes_projects(load_workspaces())
             except Exception:
                 merged = wss
-            return j(handler, {"ok": True, "workspaces": merged})
+            return j(handler, {"ok": True, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
         # Local mirror found. If projects.db also owns this path it is
         # authoritative for the name: rename there FIRST — a failed shared
         # rename must not commit a local name the next GET would revert
@@ -32558,7 +32604,7 @@ def _handle_workspace_rename(handler, body):
             merged = merge_hermes_projects(wss, profile=active_profile)
         except Exception:
             merged = wss
-        return j(handler, {"ok": True, "workspaces": merged})
+        return j(handler, {"ok": True, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
 def _handle_workspace_reorder(handler, body):
     """Reorder workspaces by providing an ordered list of paths.
@@ -32772,7 +32818,7 @@ def _handle_workspace_reorder(handler, body):
             merged = merge_hermes_projects(reordered, profile=active_profile)
         except Exception:
             merged = reordered
-        return j(handler, {"ok": True, "workspaces": merged})
+        return j(handler, {"ok": True, "workspaces": merged, "rev": _ws_catalog_rev(), "boot": _ws_catalog_boot(), "profile": _ws_catalog_profile()})
 
 def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: str = "") -> bool:
     """Resolve an approval through the existing callback path.

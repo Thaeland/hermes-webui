@@ -38,6 +38,44 @@ _ESCAPE_AUTH_TOKENS: dict[str, dict[str, str | int | float]] = {}
 # read-modify-write window enough for a concurrent mutation to be lost.
 WORKSPACE_MUTATION_LOCK = threading.RLock()
 
+# #5763 round 14 (omp review F1): a client cannot order catalog snapshots by
+# request send time — GET /api/workspaces reads without WORKSPACE_MUTATION_LOCK
+# (it must not queue behind the up-to-30s create_project subprocess lane), and
+# lock-acquisition order among concurrent mutations is scheduler-determined.
+# So the server stamps every catalog snapshot with a monotonic revision,
+# bumped on every successful save_workspaces write. Clients gate list updates
+# on the revision: a response may replace the cached list only if its revision
+# is not older than the one already applied. Bumps happen under the mutation
+# lock (or any writer); plain int reads are GIL-atomic, and the GET handler
+# re-reads around its snapshot (seqlock pattern) to stay consistent.
+_CATALOG_REV = 0
+# r14 P3-1: `global x; x += 1` is LOAD/ADD/STORE — a bump racing another
+# writer (e.g. the projects/bind save lane, which serializes on a different
+# catalog lock and must NOT take WORKSPACE_MUTATION_LOCK here without a
+# proven lock order) can lose an increment and give two commits the same rev.
+# A dedicated leaf lock makes the bump atomic without introducing any
+# lock-order edge (never acquire another lock while holding this one).
+_CATALOG_REV_LOCK = threading.Lock()
+# Per-process boot token (r14 P1-1): a restart resets _CATALOG_REV to 0,
+# which would make every new-process response look "stale" to a client that
+# published rev N pre-restart. Responses carry this token; a client that sees
+# it change resets its gate.
+_CATALOG_BOOT = secrets.token_hex(8)
+
+
+def catalog_revision() -> int:
+    return _CATALOG_REV
+
+
+def catalog_boot() -> str:
+    return _CATALOG_BOOT
+
+
+def _bump_catalog_revision() -> None:
+    global _CATALOG_REV
+    with _CATALOG_REV_LOCK:
+        _CATALOG_REV += 1
+
 from api.config import (
     WORKSPACES_FILE as _GLOBAL_WS_FILE,
     LAST_WORKSPACE_FILE as _GLOBAL_LW_FILE,
@@ -692,6 +730,7 @@ def save_workspaces(workspaces: list, profile: str | Path | None = None) -> None
     try:
         tmp.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, ws_file)
+        _bump_catalog_revision()
     finally:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)

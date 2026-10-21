@@ -469,12 +469,18 @@ def _extract_fn(src: str, header: str) -> str:
 def test_frontend_delete_and_rename_keep_invocation_identity():
     src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
     fns = _extract_fn(src, "async function deleteCurrentWorkspace(){") + "\n" + \
-        _extract_fn(src, "async function saveWorkspaceForm(){")
+        _extract_fn(src, "async function saveWorkspaceForm(){") + "\n" + \
+        _extract_fn(src, "function _publishWorkspaceList(")
     script = textwrap.dedent("""
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'edit', _workspaceList = [];
         let _workspacePreFormDetail = null;
         let _workspaceUiGen = 0;
+        // Fallback rev+boot+profile gate for pre-fix sources; the real
+        // _publishWorkspaceList extracted from panels.js (a hoisted
+        // declaration) overrides it when present (#5763 r16 P3-4).
+        let _wsListPublishedRev = -1, _wsListPublishedBoot = null;
+        function _publishWorkspaceList(rev, list, boot, profile){ if (profile && typeof S !== 'undefined' && S.activeProfile && profile !== S.activeProfile) return false; if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; } boot = (boot === undefined) ? null : boot; if (boot !== _wsListPublishedBoot) { _wsListPublishedBoot = boot; _wsListPublishedRev = rev; _workspaceList = list; return true; } if (rev < _wsListPublishedRev) return false; _wsListPublishedRev = rev; _workspaceList = list; return true; }
         const calls = [];
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingConfirm = null, pendingApi = [];
@@ -536,12 +542,18 @@ def test_frontend_add_sends_name_and_does_not_rename_native_sibling():
     """Add beside an existing native row must send name on add and must not
     follow up with a path-first rename that carries the native project_id."""
     src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
-    fns = _extract_fn(src, "async function saveWorkspaceForm(){")
+    fns = _extract_fn(src, "async function saveWorkspaceForm(){") + "\n" + \
+        _extract_fn(src, "function _publishWorkspaceList(")
     script = textwrap.dedent("""
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'create', _workspaceList = [];
         let _workspacePreFormDetail = null;
         let _workspaceUiGen = 0;
+        // Fallback rev+boot+profile gate for pre-fix sources; the real
+        // _publishWorkspaceList extracted from panels.js (a hoisted
+        // declaration) overrides it when present (#5763 r16 P3-4).
+        let _wsListPublishedRev = -1, _wsListPublishedBoot = null;
+        function _publishWorkspaceList(rev, list, boot, profile){ if (profile && typeof S !== 'undefined' && S.activeProfile && profile !== S.activeProfile) return false; if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; } boot = (boot === undefined) ? null : boot; if (boot !== _wsListPublishedBoot) { _wsListPublishedBoot = boot; _wsListPublishedRev = rev; _workspaceList = list; return true; } if (rev < _wsListPublishedRev) return false; _wsListPublishedRev = rev; _workspaceList = list; return true; }
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingApi = [];
         const api = (url, opts) => { const d = deferred(); pendingApi.push({url, body: opts && opts.body ? JSON.parse(opts.body) : null, d}); return d; };
@@ -579,6 +591,11 @@ def test_frontend_open_detail_absent_identity_does_not_open():
         const assert = require('assert');
         let _workspaceList = [{path: '/p', project_id: 'B', workspace_kind: '', name: 'B'}];
         let _workspaceUiGen = 0;
+        // Fallback rev+boot+profile gate for pre-fix sources; the real
+        // _publishWorkspaceList extracted from panels.js (a hoisted
+        // declaration) overrides it when present (#5763 r16 P3-4).
+        let _wsListPublishedRev = -1, _wsListPublishedBoot = null;
+        function _publishWorkspaceList(rev, list, boot, profile){ if (profile && typeof S !== 'undefined' && S.activeProfile && profile !== S.activeProfile) return false; if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; } boot = (boot === undefined) ? null : boot; if (boot !== _wsListPublishedBoot) { _wsListPublishedBoot = boot; _wsListPublishedRev = rev; _workspaceList = list; return true; } if (rev < _wsListPublishedRev) return false; _wsListPublishedRev = rev; _workspaceList = list; return true; }
         let rendered = null, active = 0;
         const document = { querySelectorAll: () => [] };
         const _renderWorkspaceDetail = (ws) => { rendered = ws; };
@@ -595,16 +612,24 @@ def test_frontend_open_detail_absent_identity_does_not_open():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-def test_frontend_stale_rename_get_does_not_publish_over_new_selection():
-    """A's refresh GET already in flight, then switch to B: late A response
-    must not replace B's catalog, form snapshot, or render."""
+def test_frontend_late_rename_get_publishes_fresh_catalog_without_touching_new_selection():
+    """A's refresh GET already in flight, then switch to B: the GET is a fresh
+    server read taken after A's rename landed (and after B's row — the server
+    serialized both), so round 12 lets it publish the catalog; the form
+    snapshot, reopen, and toast stay fenced."""
     src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
-    fns = _extract_fn(src, "async function saveWorkspaceForm(){")
+    fns = _extract_fn(src, "async function saveWorkspaceForm(){") + "\n" + \
+        _extract_fn(src, "function _publishWorkspaceList(")
     script = textwrap.dedent("""
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'edit', _workspaceList = [];
         let _workspacePreFormDetail = null;
         let _workspaceUiGen = 0;
+        // Fallback rev+boot+profile gate for pre-fix sources; the real
+        // _publishWorkspaceList extracted from panels.js (a hoisted
+        // declaration) overrides it when present (#5763 r16 P3-4).
+        let _wsListPublishedRev = -1, _wsListPublishedBoot = null;
+        function _publishWorkspaceList(rev, list, boot, profile){ if (profile && typeof S !== 'undefined' && S.activeProfile && profile !== S.activeProfile) return false; if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; } boot = (boot === undefined) ? null : boot; if (boot !== _wsListPublishedBoot) { _wsListPublishedBoot = boot; _wsListPublishedRev = rev; _workspaceList = list; return true; } if (rev < _wsListPublishedRev) return false; _wsListPublishedRev = rev; _workspaceList = list; return true; }
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingApi = [];
         const api = (url, opts) => { const d = deferred(); pendingApi.push({url, body: opts && opts.body ? JSON.parse(opts.body) : null, d}); return d; };
@@ -635,11 +660,12 @@ def test_frontend_stale_rename_get_does_not_publish_over_new_selection():
           _workspaceList = [B];
           _workspacePreFormDetail = { ...B };
           const renderedAfterSwitch = rendered;
-          pendingApi[1].d.resolve({workspaces: [A]});
+          pendingApi[1].d.resolve({workspaces: [{...A, name: 'Renamed'}, B]});
           await run;
-          assert.deepStrictEqual(_workspaceList, [B], 'late A catalog must not replace B');
+          assert.deepStrictEqual(_workspaceList, [{...A, name: 'Renamed'}, B],
+            'the post-rename GET is the fresher catalog — it lands, with B intact');
+          assert.strictEqual(rendered, renderedAfterSwitch + 1, 'the refreshed list must re-render');
           assert.deepStrictEqual(_workspacePreFormDetail, B, 'must not clear B form snapshot');
-          assert.strictEqual(rendered, renderedAfterSwitch, 'must not re-render from stale A GET');
           assert.strictEqual(opened, null, 'must not reopen A');
         })().catch((err) => { console.error(err && err.stack || err); process.exit(1); });
     """).replace("__FNS__", fns)
@@ -653,12 +679,18 @@ def _workspace_form_harness(src: str, body: str) -> str:
         _extract_fn(src, "function openWorkspaceCreate(){"),
         _extract_fn(src, "function editCurrentWorkspace(){"),
         _extract_fn(src, "function cancelWorkspaceForm(){"),
+        _extract_fn(src, "function _publishWorkspaceList("),
     ])
     return textwrap.dedent("""
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'edit', _workspaceList = [];
         let _workspacePreFormDetail = null;
         let _workspaceUiGen = 0;
+        // Fallback rev+boot+profile gate for pre-fix sources; the real
+        // _publishWorkspaceList extracted from panels.js (a hoisted
+        // declaration) overrides it when present (#5763 r16 P3-4).
+        let _wsListPublishedRev = -1, _wsListPublishedBoot = null;
+        function _publishWorkspaceList(rev, list, boot, profile){ if (profile && typeof S !== 'undefined' && S.activeProfile && profile !== S.activeProfile) return false; if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; } boot = (boot === undefined) ? null : boot; if (boot !== _wsListPublishedBoot) { _wsListPublishedBoot = boot; _wsListPublishedRev = rev; _workspaceList = list; return true; } if (rev < _wsListPublishedRev) return false; _wsListPublishedRev = rev; _workspaceList = list; return true; }
         let _currentPanel = 'workspaces';
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingApi = [];
@@ -706,7 +738,7 @@ def test_frontend_stale_rename_get_does_not_clobber_new_space_form():
           await run;
           assert.strictEqual(_workspaceMode, 'create', 'late A GET must not switch create → read');
           assert.deepStrictEqual(_workspacePreFormDetail, snap, 'must keep the newer form snapshot');
-          assert.strictEqual(rendered, renderedAfter, 'must not re-render from stale A GET');
+          assert.strictEqual(rendered, renderedAfter + 1, 'the post-rename GET refreshes the list');
           assert.strictEqual(opened, null);
     """)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
@@ -735,7 +767,7 @@ def test_frontend_stale_rename_get_does_not_clobber_reopened_edit_form():
           await run;
           assert.strictEqual(_workspaceMode, 'edit', 'late A GET must not switch edit → read');
           assert.deepStrictEqual(_workspacePreFormDetail, snap, 'must keep the newer edit snapshot');
-          assert.strictEqual(rendered, renderedAfter);
+          assert.strictEqual(rendered, renderedAfter + 1, 'the post-rename GET refreshes the list');
           assert.strictEqual(opened, null);
     """)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)

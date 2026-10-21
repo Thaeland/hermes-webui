@@ -5974,6 +5974,41 @@ async function submitMemorySave() {
 
 // ── Workspace management ──
 let _workspaceList = [];  // cached from /api/workspaces
+// #5763 round 14 (omp review F1): a response's list snapshot is ordered by
+// the server's catalog revision (api/workspace.py catalog_revision), not by
+// client send time — the GET endpoint reads without the mutation lock and
+// lock-acquisition order among mutations is scheduler-determined, so send
+// order proves nothing about snapshot freshness. A response may replace the
+// cached list (and re-render) only if its rev is not older than the newest
+// rev already applied; payloads without a rev (older server) publish as-is.
+// The _workspaceUiGen guard remains for navigation (form / detail side
+// effects); revision gating fences recency. Writers that bypass this helper
+// (profile-switch reset) are noted at their sites.
+let _wsListPublishedRev = -1;
+let _wsListPublishedBoot = null;
+function _publishWorkspaceList(rev, list, boot, profile){
+  // r15 P2: the rev counter is process-global, so after a profile switch a
+  // stale old-profile response is always rev-acceptable. The server echoes
+  // the profile it served; drop mismatches before the rev gate so they can
+  // neither publish nor poison the gate state.
+  if (profile && typeof S !== 'undefined' && S.activeProfile
+      && profile !== S.activeProfile) return false;
+  if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; }
+  // r14 P1-1: a server restart resets the revision counter; a changed boot
+  // token means the counter restarted, so comparisons to the old domain are
+  // meaningless — reset and accept.
+  boot = (boot === undefined) ? null : boot;
+  if (boot !== _wsListPublishedBoot) {
+    _wsListPublishedBoot = boot;
+    _wsListPublishedRev = rev;
+    _workspaceList = list;
+    return true;
+  }
+  if (rev < _wsListPublishedRev) return false;
+  _wsListPublishedRev = rev;
+  _workspaceList = list;
+  return true;
+}
 let _wsSuggestTimer = null;
 let _wsSuggestReq = 0;
 let _wsSuggestIndex = -1;
@@ -6115,9 +6150,13 @@ function syncWorkspaceDisplays(){
 async function loadWorkspaceList(){
   try{
     const data = await api('/api/workspaces');
+    // r14 P2-3: drop a wrong-profile GET before ANY side effect (terminal
+    // backend sync included), not just the publish. The gate re-checks for
+    // the mutation lanes, which have no such pre-check of their own.
+    if (data.profile && typeof S !== 'undefined' && S.activeProfile
+        && data.profile !== S.activeProfile) return data;
     if(typeof syncTerminalBackendState==='function') syncTerminalBackendState(data);
-    _workspaceList = data.workspaces || [];
-    syncWorkspaceDisplays();
+    if (_publishWorkspaceList(data.rev, data.workspaces || [], data.boot, data.profile)) syncWorkspaceDisplays();
     if(typeof syncTerminalButton==='function') syncTerminalButton();
     return data;
   }catch(e){ return {workspaces:[], last:''}; }
@@ -6318,7 +6357,9 @@ function toggleWsDropdown(){
   else{
     closeProfileDropdown(); // close profile dropdown if open
     loadWorkspaceList().then(data=>{
-      renderWorkspaceDropdownInto(dd, data.workspaces, S.session?.workspace||S._profileDefaultWorkspace||data.last||'');
+      // r14 P3-2: render the gated cache — a rev-rejected snapshot must not
+      // reach the dropdown DOM either.
+      renderWorkspaceDropdownInto(dd, _workspaceList || [], S.session?.workspace||S._profileDefaultWorkspace||data.last||'');
       _setWorkspaceDropdownOpenState(dd,true);
     });
   }
@@ -6338,7 +6379,8 @@ function toggleComposerWsDropdown(){
     if(typeof closeModelDropdown==='function') closeModelDropdown();
     if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
     loadWorkspaceList().then(data=>{
-      renderWorkspaceDropdownInto(dd, data.workspaces, S.session?.workspace||S._profileDefaultWorkspace||data.last||'');
+      // r14 P3-2: gated cache (see toggleWsDropdown).
+      renderWorkspaceDropdownInto(dd, _workspaceList || [], S.session?.workspace||S._profileDefaultWorkspace||data.last||'');
       _setWorkspaceDropdownOpenState(dd,true);
       _positionComposerWsDropdown();
       if(chip){
@@ -6384,8 +6426,10 @@ window.addEventListener('resize',()=>{
 async function loadWorkspacesPanel(){
   const panel=$('workspacesPanel');
   if(!panel)return;
-  const data=await loadWorkspaceList();
-  renderWorkspacesPanel(data.workspaces);
+  await loadWorkspaceList();
+  // #5763 round 14 (omp review F2): render the gated cache, not the raw
+  // response — a rev-rejected snapshot must not reach the DOM either.
+  renderWorkspacesPanel(_workspaceList || []);
 }
 
 function renderWorkspacesPanel(workspaces){
@@ -6481,7 +6525,9 @@ function renderWorkspacesPanel(workspaces){
           body: JSON.stringify({ paths: currentIds })
         });
         if(res && res.ok){
-          renderWorkspacesPanel(res.workspaces);
+          // #5763 round 14 (omp review F3): reorder is a mutation — publish
+          // its snapshot through the rev gate and render the gated cache.
+          if (_publishWorkspaceList(res.rev, res.workspaces, res.boot, res.profile)) renderWorkspacesPanel(_workspaceList);
           // Also refresh sidebar dropdown
           loadWorkspaceList().then(() => {});
         }
@@ -6643,18 +6689,23 @@ async function deleteCurrentWorkspace(){
     const body={path};
     if(target.workspace_kind) body.workspace_kind=target.workspace_kind;
     if(target.project_id) body.project_id=target.project_id;
-    // Round 11 sibling (omp review): a late remove response must not overwrite
-    // _workspaceList with its pre-interruption snapshot (a newer list would
-    // vanish) nor re-render over a form the user opened meanwhile.
+    // Round 11 sibling (omp review) + round 12 split (greptile P2): the
+    // server-side remove has already happened when the response lands, so the
+    // catalog refresh is applied even if the user moved on — dropping it left
+    // the removed row clickable until a manual reload. Only the form/detail
+    // side effects (detail clear, toast) stay fenced by the generation guard.
+    // Round 13 (omp review): the refresh is additionally gated by recency —
+    // a slow response's snapshot can predate a concurrent mutation that has
+    // already published, and re-rendering a stale list would also clear an
+    // open detail whose row the snapshot lacks.
     const gen = _workspaceUiGen;
     const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify(body)});
+    if (_publishWorkspaceList(data.rev, data.workspaces || [], data.boot, data.profile)) renderWorkspacesPanel(_workspaceList);
     if (gen !== _workspaceUiGen) return;
-    _workspaceList=data.workspaces;
     const cd=_currentWorkspaceDetail;
     // Only clear the detail if it still shows the removed row.
     if(cd && cd.path===target.path && (cd.workspace_kind||'')===target.workspace_kind
        && (cd.project_id||'')===target.project_id) _clearWorkspaceDetail();
-    renderWorkspacesPanel(data.workspaces);
     showToast(t('workspace_removed'));
   }catch(e){setStatus(t('remove_failed')+e.message);}
 }
@@ -6757,13 +6808,16 @@ async function saveWorkspaceForm(){
       if(target.workspace_kind) body.workspace_kind=target.workspace_kind;
       if(target.project_id) body.project_id=target.project_id;
       await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify(body) });
-      if (gen !== _workspaceUiGen) return;
+      // Round 12 split (greptile P2): the rename already landed server-side;
+      // the refreshed list is applied even when the user moved on. Only the
+      // form/detail side effects (reopen, toast, form snapshot) stay fenced.
+      // Round 14: the refresh is rev-gated — this GET's snapshot carries the
+      // server revision and loses only to a genuinely newer publish.
       const data = await api('/api/workspaces');
+      if (_publishWorkspaceList(data.rev, data.workspaces || [], data.boot, data.profile)) renderWorkspacesPanel(_workspaceList);
       if (gen !== _workspaceUiGen) return;
-      _workspaceList = data.workspaces || [];
       _workspacePreFormDetail = null;
       showToast(t('workspace_renamed') || t('workspace_added'));
-      renderWorkspacesPanel(_workspaceList);
       const still = _currentWorkspaceDetail
         && _currentWorkspaceDetail.path === target.path
         && (_currentWorkspaceDetail.workspace_kind||'') === target.workspace_kind
@@ -6778,15 +6832,15 @@ async function saveWorkspaceForm(){
     const asProjectEl = $('workspaceFormAsProject');
     const asProject = asProjectEl ? asProjectEl.checked : false;
     if (asProject) {
-      // Greptile P2 (round 11): the create request can wait seconds on the
-      // subprocess lane; reject a late response once the user has left this
-      // form (same _workspaceUiGen guard the rename branch uses).
+      // Greptile P2 (round 11) + round 12 split: the create request can wait
+      // seconds on the subprocess lane; a late response must not reopen a
+      // detail or toast over a newer form, but the catalog refresh lands —
+      // the project exists server-side and must not stay missing from the list.
       const gen = _workspaceUiGen;
       const data = await api('/api/workspaces/create_project', { method:'POST', body: JSON.stringify({ path, name, create: true }) });
+      if (_publishWorkspaceList(data.rev, data.workspaces || [], data.boot, data.profile)) renderWorkspacesPanel(_workspaceList);
       if (gen !== _workspaceUiGen) return;
-      _workspaceList = data.workspaces || [];
       _workspacePreFormDetail = null;
-      renderWorkspacesPanel(_workspaceList);
       const proj = data.project || {};
       showToast(proj.error ? (t('error_prefix') + proj.error) : (t('workspace_project_created') || 'Hermes Project created'));
       // Match on the server-normalized path (proj.path): the user may have
@@ -6799,13 +6853,13 @@ async function saveWorkspaceForm(){
     }
     const addBody = { path };
     if (name) addBody.name = name;
-    // Same stale-response guard as the create_project branch above.
+    // Same stale-response guard as the create_project branch above (round 12:
+    // list refresh lands, form/detail side effects stay fenced).
     const addGen = _workspaceUiGen;
     const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify(addBody) });
+    if (_publishWorkspaceList(data.rev, data.workspaces || [], data.boot, data.profile)) renderWorkspacesPanel(_workspaceList);
     if (addGen !== _workspaceUiGen) return;
-    _workspaceList = data.workspaces || [];
     _workspacePreFormDetail = null;
-    renderWorkspacesPanel(_workspaceList);
     showToast(t('workspace_added'));
     // Match the added row by identity, not first path hit: a native
     // sibling can share the spelling and sits first in the merged list.
@@ -6882,8 +6936,7 @@ async function removeWorkspace(pathOrWs){
     if(ws && ws.workspace_kind) body.workspace_kind=ws.workspace_kind;
     if(ws && ws.project_id) body.project_id=ws.project_id;
     const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify(body)});
-    _workspaceList=data.workspaces;
-    renderWorkspacesPanel(data.workspaces);
+    if (_publishWorkspaceList(data.rev, data.workspaces || [], data.boot, data.profile)) renderWorkspacesPanel(_workspaceList);
     showToast(t('workspace_removed'));
   }catch(e){setStatus(t('remove_failed')+e.message);}
 }
@@ -6912,11 +6965,15 @@ async function promptWorkspacePath(){
   if(!path)return;
   try{
     const data=await api('/api/workspaces/add',{method:'POST',body:JSON.stringify({path})});
-    _workspaceList=data.workspaces||[];
+    // Rev-gated publish (#5763 round 14). If a newer rev already published,
+    // its snapshot postdates this add's commit and already contains the row;
+    // a row absent from it was deleted after the add — no fallback to this
+    // response's (older) snapshot (#5763 round 16, omp r15 P3-1).
+    _publishWorkspaceList(data.rev, data.workspaces||[], data.boot, data.profile);
     // Find the added row by the server-normalized path (data.path): the
     // response is the merged projection and may end with DB-only neighbours,
     // and the typed path ('~/x', trailing slash) never equals the stored row.
-    const target=_workspaceList.find(w=>w.path===(data.path||path));
+    const target=(_workspaceList||[]).find(w=>w.path===(data.path||path));
     if(!target) throw new Error(t('workspace_not_added'));
     await switchToWorkspace(target.path,target.name);
   }catch(e){
@@ -7763,6 +7820,10 @@ async function switchToProfile(name) {
     if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
     else localStorage.removeItem('hermes-webui-model');
     _skillsData = null;
+    // #5763 round 14 (omp review F5): this reset intentionally bypasses the
+    // rev gate (the new profile's catalog starts fresh client-side). An
+    // in-flight old-profile response can still refill the cache until the
+    // next rev-gated publish — pre-existing, bounded by the switch refresh.
     _workspaceList = null;
     if (data.default_model) window._defaultModel = data.default_model;
     if (data.default_model_provider) window._activeProvider = data.default_model_provider;

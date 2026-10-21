@@ -160,12 +160,18 @@ def _form_harness(src: str, body: str) -> str:
     fns = "\n".join([
         _extract_fn(src, "async function saveWorkspaceForm(){"),
         _extract_fn(src, "function openWorkspaceCreate(){"),
+        _extract_fn(src, "function _publishWorkspaceList("),
     ])
     return textwrap.dedent("""
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'create', _workspaceList = [];
         let _workspacePreFormDetail = null;
         let _workspaceUiGen = 0;
+        // Fallback rev+boot+profile gate for pre-fix sources; the real
+        // _publishWorkspaceList extracted from panels.js (a hoisted
+        // declaration) overrides it when present (#5763 r16 P3-4).
+        let _wsListPublishedRev = -1, _wsListPublishedBoot = null;
+        function _publishWorkspaceList(rev, list, boot, profile){ if (profile && typeof S !== 'undefined' && S.activeProfile && profile !== S.activeProfile) return false; if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; } boot = (boot === undefined) ? null : boot; if (boot !== _wsListPublishedBoot) { _wsListPublishedBoot = boot; _wsListPublishedRev = rev; _workspaceList = list; return true; } if (rev < _wsListPublishedRev) return false; _wsListPublishedRev = rev; _workspaceList = list; return true; }
         let _currentPanel = 'workspaces';
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingApi = [];
@@ -197,7 +203,8 @@ def _form_harness(src: str, body: str) -> str:
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_frontend_stale_create_project_response_does_not_clobber_new_form():
-    """Late create_project response must not clobber a newer create form."""
+    """Late create_project response refreshes the list but must not clobber
+    a newer create form's detail state (round 12 contract split)."""
     src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
     script = _form_harness(src, """
           _workspaceMode = 'create';
@@ -208,14 +215,16 @@ def test_frontend_stale_create_project_response_does_not_clobber_new_form():
           // User leaves the form and opens a fresh create form while the
           // create request (subprocess lane: seconds) is still pending.
           openWorkspaceCreate();
-          const listBefore = _workspaceList;
           const renderedAfter = rendered;
           pendingApi[0].d.resolve({workspaces: [A, {path: '/srv/www', name: 'N'}],
                                    project: {path: '/srv/www'}});
           await run;
-          assert.strictEqual(rendered, renderedAfter, 'late create response must not re-render the panel');
+          // Round 12: the catalog refresh is no longer fenced — the server
+          // mutation already happened and the list must not stay stale. Only
+          // the form/detail side effects (reopen, toast) stay rejected.
+          assert.strictEqual(rendered, renderedAfter + 1, 'late create response must refresh the list');
+          assert.strictEqual(_workspaceList.length, 2, 'late create response must update the catalog');
           assert.strictEqual(opened, null, 'late create response must not open the created detail over the new form');
-          assert.strictEqual(_workspaceList, listBefore, 'late create response must not replace the catalog');
     """)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
     assert res.returncode == 0, res.stderr or res.stdout
@@ -243,8 +252,8 @@ def test_frontend_create_project_response_still_applies_when_form_untouched():
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_frontend_stale_plain_add_response_does_not_clobber_new_form():
-    """Same class as the create branch: a late plain-add response must not
-    clobber a newer form either (sibling sweep of the same guard)."""
+    """Same class as the create branch: a late plain-add response refreshes
+    the list but must not clobber a newer form (sibling sweep, round 12)."""
     src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
     script = _form_harness(src, """
           _workspaceMode = 'create';
@@ -254,13 +263,13 @@ def test_frontend_stale_plain_add_response_does_not_clobber_new_form():
           await tick();
           assert.strictEqual(pendingApi[0].url, '/api/workspaces/add');
           openWorkspaceCreate();
-          const listBefore = _workspaceList;
           const renderedAfter = rendered;
           pendingApi[0].d.resolve({workspaces: [A, {path: '/srv/www', name: 'N'}], path: '/srv/www'});
           await run;
-          assert.strictEqual(rendered, renderedAfter, 'late add response must not re-render the panel');
+          // Round 12: catalog refresh stays live; only the detail reopen is fenced.
+          assert.strictEqual(rendered, renderedAfter + 1, 'late add response must refresh the list');
+          assert.strictEqual(_workspaceList.length, 2, 'late add response must update the catalog');
           assert.strictEqual(opened, null, 'late add response must not open a detail over the new form');
-          assert.strictEqual(_workspaceList, listBefore, 'late add response must not replace the catalog');
     """)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
     assert res.returncode == 0, res.stderr or res.stdout
@@ -273,12 +282,18 @@ def _action_harness(src: str, body: str) -> str:
         _extract_fn(src, "async function activateCurrentWorkspace(){"),
         _extract_fn(src, "async function deleteCurrentWorkspace(){"),
         _extract_fn(src, "function openWorkspaceCreate(){"),
+        _extract_fn(src, "function _publishWorkspaceList("),
     ])
     return textwrap.dedent("""
         const assert = require('assert');
         let _currentWorkspaceDetail = null, _workspaceMode = 'empty', _workspaceList = [];
         let _workspacePreFormDetail = null;
         let _workspaceUiGen = 0;
+        // Fallback rev+boot+profile gate for pre-fix sources; the real
+        // _publishWorkspaceList extracted from panels.js (a hoisted
+        // declaration) overrides it when present (#5763 r16 P3-4).
+        let _wsListPublishedRev = -1, _wsListPublishedBoot = null;
+        function _publishWorkspaceList(rev, list, boot, profile){ if (profile && typeof S !== 'undefined' && S.activeProfile && profile !== S.activeProfile) return false; if (typeof rev !== 'number' || !isFinite(rev)) { _workspaceList = list; return true; } boot = (boot === undefined) ? null : boot; if (boot !== _wsListPublishedBoot) { _wsListPublishedBoot = boot; _wsListPublishedRev = rev; _workspaceList = list; return true; } if (rev < _wsListPublishedRev) return false; _wsListPublishedRev = rev; _workspaceList = list; return true; }
         let _currentPanel = 'workspaces';
         const deferred = () => { let r; const p = new Promise(res => r = res); p.resolve = r; return p; };
         let pendingApi = [];
@@ -311,8 +326,8 @@ def _action_harness(src: str, body: str) -> str:
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_frontend_stale_delete_response_does_not_clobber_newer_list():
-    """Late remove response must not overwrite _workspaceList with its
-    pre-interruption snapshot or re-render over a newer form."""
+    """Late remove response must refresh the catalog (round 12) but must not
+    re-render a detail or toast over a form the user opened meanwhile."""
     src = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
     script = _action_harness(src, """
           _currentWorkspaceDetail = A;
@@ -321,15 +336,19 @@ def test_frontend_stale_delete_response_does_not_clobber_newer_list():
           const run = deleteCurrentWorkspace();
           await tick();
           assert.strictEqual(pendingApi[0].url, '/api/workspaces/remove');
-          // User opens a fresh create form while the remove is in flight;
-          // meanwhile a newer list (B still present, C added) arrives.
+          // User opens a fresh create form while the remove is in flight.
+          // (The concurrent case — a newer list published before this
+          // response lands — is pinned by the round 13 recency-gate tests;
+          // here nothing else publishes, so this snapshot is the freshest.)
           openWorkspaceCreate();
-          const listBefore = _workspaceList;
           const renderedAfter = rendered;
           pendingApi[0].d.resolve({workspaces: [B]});
           await run;
-          assert.strictEqual(_workspaceList, listBefore, 'late remove response must not replace the catalog');
-          assert.strictEqual(rendered, renderedAfter, 'late remove response must not re-render the panel');
+          // Round 12: the removed row must disappear from the picker even
+          // when the response lands after the user moved on; only the
+          // detail/toast side effects are fenced.
+          assert.deepStrictEqual(_workspaceList, [B], 'late remove response must still refresh the catalog');
+          assert.strictEqual(rendered, renderedAfter + 1, 'late remove response must re-render the list');
     """)
     res = subprocess.run(["node", "-e", script], cwd=REPO_ROOT, text=True, capture_output=True)
     assert res.returncode == 0, res.stderr or res.stdout
