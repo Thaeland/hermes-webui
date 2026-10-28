@@ -460,6 +460,27 @@ def _invalidate_cache(db: Path) -> None:
         _cache.pop(str(db), None)
 
 
+def _note_catalog_commit(db: Path) -> None:
+    """A committed projects.db write changed the picker catalog: drop the read
+    cache, THEN advance the workspace catalog revision.
+
+    save_workspaces() is the only other bumper, and the native-only lanes
+    (rename by project_id with no mirror row, path rename of a Desktop/CLI
+    project, create over an existing mirror row) never save locally, so their
+    responses carried the pre-commit revision and an older GET with the same
+    revision repainted the old row (#7957 round 12 re-gate). Order matters:
+    the GET reads rev_before and then loads, so the bump must follow both the
+    commit and the cache drop for "read rev N before the load => the load
+    sees commit N" to hold.
+    """
+    _invalidate_cache(db)
+    try:
+        from api.workspace import _bump_catalog_revision
+        _bump_catalog_revision()
+    except Exception:  # pragma: no cover - never fail an already-committed write
+        logger.debug("catalog revision bump failed", exc_info=True)
+
+
 def _agent_dir() -> Path | None:
     """Locate the hermes-agent checkout (same discovery order as api.config)."""
     try:
@@ -648,7 +669,7 @@ def create_hermes_project(path: str, name: str, profile_home: Path | None = None
                 raise ValueError(payload.get("error") or "project creation rejected")
             raise RuntimeError(payload.get("error") or "project creation failed")
         pid, slug = payload["id"], payload.get("slug")
-    _invalidate_cache(db)
+    _note_catalog_commit(db)
     return {"id": pid, "slug": slug, "name": name, "path": resolved, "created": True}
 
 
@@ -861,7 +882,10 @@ def archive_hermes_project(path: str, profile_home: Path | None = None,
                     n = conn.execute(
                         "UPDATE projects SET archived = 1 WHERE id = ?", (pid,)
                     ).rowcount
-                _invalidate_cache(db)
+                if n:
+                    _note_catalog_commit(db)
+                else:
+                    _invalidate_cache(db)
                 return {"archived": bool(n), "id": pid}
             finally:
                 with contextlib.suppress(Exception):
@@ -897,7 +921,7 @@ def archive_hermes_project(path: str, profile_home: Path | None = None,
     if not payload or not payload.get("ok"):
         logger.debug("archive_hermes_project subprocess result: %s", payload)
         return {"archived": False, "reason": "error"}
-    _invalidate_cache(db)
+    _note_catalog_commit(db)
     return payload
 
 
@@ -1018,7 +1042,10 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
                     n = conn.execute(
                         "UPDATE projects SET name = ? WHERE id = ?", (name, pid)
                     ).rowcount
-                _invalidate_cache(db)
+                if n:
+                    _note_catalog_commit(db)
+                else:
+                    _invalidate_cache(db)
                 return {"renamed": bool(n), "id": pid}
             finally:
                 with contextlib.suppress(Exception):
@@ -1052,5 +1079,5 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     if not payload or not payload.get("ok"):
         logger.debug("rename_hermes_project subprocess result: %s", payload)
         return {"renamed": False, "reason": "error"}
-    _invalidate_cache(db)
+    _note_catalog_commit(db)
     return payload

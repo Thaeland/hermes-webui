@@ -491,3 +491,80 @@ def test_add_rejects_duplicate_under_symlink_spelling(tmp_path, monkeypatch):
     handler.send_response.assert_called_once_with(400)
     body = _response(handler)
     assert "already in list" in body.get("error", "").lower()
+
+
+# ── Round 12 re-gate (RM fold): native-only writes advance the catalog rev ──
+#
+# save_workspaces() was the only revision bumper, so the lanes that change the
+# picker by writing projects.db alone (rename via project_id with no mirror
+# row, path rename of a Desktop/CLI project) answered with the PRE-commit
+# revision. A GET that started before the rename and landed after it carried
+# the same revision with the old name, and the client gate (equal revisions
+# accepted) repainted the old name until the next load.
+
+
+def _rename_db_only(db_only, body_extra=None):
+    from api.routes import _handle_workspace_rename
+    handler = _make_handler()
+    body = {"path": str(db_only), "name": "Renamed DB", **(body_extra or {})}
+    with patch("api.routes.load_workspaces", return_value=[]), \
+         patch("api.routes.save_workspaces", side_effect=AssertionError("DB-only rename must not save locally")):
+        _handle_workspace_rename(handler, body)
+    handler.send_response.assert_called_once_with(200)
+    return _response(handler)
+
+
+@requires_manager
+@pytest.mark.parametrize("lane", ["path", "project_id"])
+@pytest.mark.parametrize("writer", ["in-process", "subprocess"])
+def test_db_only_rename_answers_with_a_newer_revision(db_only, monkeypatch, lane, writer):
+    from api.workspace import catalog_revision
+    if writer == "subprocess":
+        from api.projects_bridge import _agent_dir
+        if _agent_dir() is None:
+            pytest.skip("no agent checkout for the subprocess writer")
+        monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
+    before = catalog_revision()
+    resp = _rename_db_only(db_only, {"project_id": "p_db1"} if lane == "project_id" else None)
+    entry = next(w for w in resp["workspaces"] if w["path"] == str(db_only))
+    assert entry["name"] == "Renamed DB"
+    # A GET snapshot taken before the commit carries at most `before`; the
+    # rename response must outrank it or that straggler repaints the old name.
+    assert resp["rev"] > before
+    assert resp["rev"] == catalog_revision()
+
+
+@requires_manager
+def test_revision_advances_only_after_the_commit_and_the_cache_drop(db_only, monkeypatch):
+    # The GET handler reads rev_before and THEN loads the merged list; a bump
+    # that precedes the DB commit or the read-cache drop would let a snapshot
+    # stamped with the new revision still show the old name.
+    import api.workspace as ws
+    from api.projects_bridge import _cache
+    seen = []
+    real_bump = ws._bump_catalog_revision
+
+    def recording_bump():
+        conn = sqlite3.connect(db_only.parent.parent / "projects.db")
+        try:
+            name = conn.execute("SELECT name FROM projects WHERE id='p_db1'").fetchone()[0]
+        finally:
+            conn.close()
+        seen.append((name, str(db_only.parent.parent / "projects.db") in _cache))
+        real_bump()
+
+    monkeypatch.setattr(ws, "_bump_catalog_revision", recording_bump)
+    from api.projects_bridge import load_project_state
+    load_project_state()  # warm the read cache so a missing drop would show
+    _rename_db_only(db_only)
+    assert seen and seen[0] == ("Renamed DB", False)
+
+
+@requires_manager
+def test_refused_native_rename_leaves_the_revision_alone(db_only):
+    from api.projects_bridge import rename_hermes_project
+    from api.workspace import catalog_revision
+    before = catalog_revision()
+    result = rename_hermes_project(str(db_only), "Nope", project_id="p_unknown")
+    assert result.get("renamed") is False
+    assert catalog_revision() == before
