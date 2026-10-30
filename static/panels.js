@@ -6450,10 +6450,13 @@ function renderWorkspacesPanel(workspaces){
     row.draggable=true;
     const isActive = w.path === activePath;
     const activeBadge = isActive ? `<span class="detail-badge active" style="margin-left:6px;font-size:9px;padding:1px 6px">${esc(t('profile_active'))}</span>` : '';
+    // UX round 12: shared Hermes Projects must be visually distinguishable
+    // from local spaces — Remove has a different consequence for them.
+    const projectBadge = w.project_id ? `<span class="detail-badge" style="margin-left:6px;font-size:9px;padding:1px 6px">${esc(t('workspace_project_badge'))}</span>` : '';
     row.innerHTML=`
       <span class="ws-drag-handle" title="${esc(t('workspace_drag_hint'))}">${li('grip-vertical',12)}</span>
       <div class="ws-row-info">
-        <div class="ws-row-name">${esc(w.name)}${activeBadge}</div>
+        <div class="ws-row-name">${esc(w.name)}${activeBadge}${projectBadge}</div>
         <div class="ws-row-path">${esc(w.path)}</div>
       </div>`;
     // Click on info area only — not on drag handle
@@ -6563,12 +6566,18 @@ function _renderWorkspaceDetail(ws){
     ? `<span class="detail-badge active">${esc(t('profile_active'))}</span>`
     : `<span class="detail-badge">Inactive</span>`;
   const defaultBadge = isDefault ? ` <span class="detail-badge">${esc(t('profile_default_label'))}</span>` : '';
+  // UX round 12: the detail card states whether this is a shared Hermes
+  // Project (Remove archives it in Desktop/CLI) or a local-only space.
+  const kindValue = ws.project_id
+    ? `<span class="detail-badge">${esc(t('workspace_kind_project'))}</span>`
+    : `<span style="color:var(--muted)">${esc(t('workspace_kind_local'))}</span>`;
   body.innerHTML = `
     <div class="main-view-content">
       <div class="detail-card">
         <div class="detail-card-title">Space</div>
         <div class="detail-row"><div class="detail-row-label">Name</div><div class="detail-row-value">${esc(ws.name || '')}</div></div>
         <div class="detail-row"><div class="detail-row-label">Path</div><div class="detail-row-value"><code>${esc(ws.path)}</code></div></div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('workspace_kind_label'))}</div><div class="detail-row-value">${kindValue}</div></div>
         <div class="detail-row"><div class="detail-row-label">Status</div><div class="detail-row-value">${statusBadge}${defaultBadge}</div></div>
       </div>
       <div class="detail-card" style="margin-top:12px">
@@ -6683,7 +6692,10 @@ async function deleteCurrentWorkspace(){
                   workspace_kind: _currentWorkspaceDetail.workspace_kind || '',
                   project_id: _currentWorkspaceDetail.project_id || ''};
   const path = target.path;
-  const _ok = await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
+  // UX round 12: a project-backed row archives the project in Desktop/CLI,
+  // not just the local space — the dialog must say so.
+  const _msg = target.project_id ? t('workspace_remove_confirm_project_message', path) : t('workspace_remove_confirm_message', path);
+  const _ok = await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:_msg,confirmLabel:t('remove'),danger:true,focusCancel:true});
   if(!_ok) return;
   try{
     const body={path};
@@ -6739,7 +6751,7 @@ function _renderWorkspaceForm({ name, path, isEdit }){
   const pathDisabled = isEdit ? 'disabled' : '';
   const pathHint = isEdit
     ? `<div class="detail-form-hint">${esc(t('workspace_path_readonly') || 'Path cannot be changed. Rename only.')}</div>`
-    : `<div class="detail-form-hint">${esc(t('workspace_paths_validated_hint'))}</div>`;
+    : `<div class="detail-form-hint" id="workspaceFormPathHint">${esc(t('workspace_paths_validated_hint'))}</div>`;
   body.innerHTML = `
     <div class="main-view-content">
       <form class="detail-form" onsubmit="event.preventDefault(); saveWorkspaceForm();">
@@ -6757,7 +6769,7 @@ function _renderWorkspaceForm({ name, path, isEdit }){
         </div>
         ${isEdit ? '' : `
         <div class="detail-form-row">
-          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <label class="detail-form-check" for="workspaceFormAsProject">
             <input type="checkbox" id="workspaceFormAsProject">
             <span>${esc(t('workspace_as_hermes_project') || 'Register as Hermes Project (shared with Desktop/CLI)')}</span>
           </label>
@@ -6769,6 +6781,15 @@ function _renderWorkspaceForm({ name, path, isEdit }){
   if (empty) empty.style.display = 'none';
   _setWorkspaceHeaderButtons(isEdit ? 'edit' : 'create');
   if (!isEdit) _wireWorkspaceFormPathSuggestions();
+  // UX round 12: with the box ticked the folder is auto-created, so the Path
+  // hint must stop claiming paths must be existing directories.
+  if (!isEdit) {
+    const _asProject = $('workspaceFormAsProject');
+    if (_asProject) _asProject.onchange = () => {
+      const _hint = $('workspaceFormPathHint');
+      if (_hint) _hint.textContent = _asProject.checked ? t('workspace_project_path_hint') : t('workspace_paths_validated_hint');
+    };
+  }
   const focus = isEdit ? $('workspaceFormName') : $('workspaceFormPath');
   if (focus) focus.focus();
 }
@@ -6929,7 +6950,8 @@ document.addEventListener('click',e=>{
 async function removeWorkspace(pathOrWs){
   const path = (typeof pathOrWs === 'string') ? pathOrWs : (pathOrWs && pathOrWs.path) || '';
   const ws = (typeof pathOrWs === 'object' && pathOrWs) ? pathOrWs : (_workspaceList||[]).find(w => w.path === path);
-  const _rmWs=await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
+  const _rmMsg = (ws && ws.project_id) ? t('workspace_remove_confirm_project_message', path) : t('workspace_remove_confirm_message', path);
+  const _rmWs=await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:_rmMsg,confirmLabel:t('remove'),danger:true,focusCancel:true});
   if(!_rmWs) return;
   try{
     const body={path};
