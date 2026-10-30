@@ -584,6 +584,8 @@ def test_refused_subprocess_write_leaves_the_revision_alone(db_only, monkeypatch
         pytest.skip("no agent checkout for the subprocess writer")
     monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
     before = catalog_revision()
+    from api.projects_bridge import _cache, load_project_state
+    load_project_state()  # warm the read cache so a missing drop would show
     if op == "rename":
         result = rename_hermes_project(str(db_only), "Nope", project_id="p_unknown")
         assert result.get("renamed") is False
@@ -592,3 +594,6 @@ def test_refused_subprocess_write_leaves_the_revision_alone(db_only, monkeypatch
         assert result.get("archived") is False
     assert result.get("ok") is True  # refused-but-successful protocol answer
     assert catalog_revision() == before
+    # The other half of the contract: a refused write still drops the read
+    # cache (conservative), it only skips the revision bump.
+    assert str(db_only.parent.parent / "projects.db") not in _cache
