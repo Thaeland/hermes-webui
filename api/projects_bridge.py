@@ -921,7 +921,10 @@ def archive_hermes_project(path: str, profile_home: Path | None = None,
     if not payload or not payload.get("ok"):
         logger.debug("archive_hermes_project subprocess result: %s", payload)
         return {"archived": False, "reason": "error"}
-    _note_catalog_commit(db)
+    if payload.get("archived"):
+        _note_catalog_commit(db)
+    else:
+        _invalidate_cache(db)
     return payload
 
 
@@ -1079,5 +1082,8 @@ def rename_hermes_project(path: str, name: str, profile_home: Path | None = None
     if not payload or not payload.get("ok"):
         logger.debug("rename_hermes_project subprocess result: %s", payload)
         return {"renamed": False, "reason": "error"}
-    _note_catalog_commit(db)
+    if payload.get("renamed"):
+        _note_catalog_commit(db)
+    else:
+        _invalidate_cache(db)
     return payload

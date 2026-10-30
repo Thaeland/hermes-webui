@@ -568,3 +568,27 @@ def test_refused_native_rename_leaves_the_revision_alone(db_only):
     result = rename_hermes_project(str(db_only), "Nope", project_id="p_unknown")
     assert result.get("renamed") is False
     assert catalog_revision() == before
+
+
+@requires_manager
+@pytest.mark.parametrize("op", ["rename", "archive"])
+def test_refused_subprocess_write_leaves_the_revision_alone(db_only, monkeypatch, op):
+    # Independent-review MAJOR: the subprocess programs answer a refused
+    # write (unknown id -> not-found) with ok:true and renamed/archived:
+    # false. The in-process lanes gate the revision bump on the rowcount;
+    # the subprocess parents must gate it on the payload's result flag too
+    # — a refused write must never bump the catalog revision.
+    from api.projects_bridge import _agent_dir, archive_hermes_project, rename_hermes_project
+    from api.workspace import catalog_revision
+    if _agent_dir() is None:
+        pytest.skip("no agent checkout for the subprocess writer")
+    monkeypatch.setattr("api.projects_bridge._projects_db_module", lambda: None)
+    before = catalog_revision()
+    if op == "rename":
+        result = rename_hermes_project(str(db_only), "Nope", project_id="p_unknown")
+        assert result.get("renamed") is False
+    else:
+        result = archive_hermes_project(str(db_only), project_id="p_unknown")
+        assert result.get("archived") is False
+    assert result.get("ok") is True  # refused-but-successful protocol answer
+    assert catalog_revision() == before

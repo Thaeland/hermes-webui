@@ -16,7 +16,6 @@
 """
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import subprocess
@@ -171,9 +170,13 @@ if (!body.includes('id="workspaceFormPathHint"'))
 if (!els['workspaceFormPathHint']) els['workspaceFormPathHint'] = { textContent: '' };
 const box = els['workspaceFormAsProject'];
 if (typeof box.onchange !== 'function') throw new Error('checkbox onchange not wired');
+const HINT = els['workspaceFormPathHint'];
 box.checked = true; box.onchange();
-if (!box.onchange.toString().includes('workspace_project_path_hint'))
-  throw new Error('onchange must swap in the auto-create hint');
+if (HINT.textContent !== T.workspace_project_path_hint)
+  throw new Error('ticked box must swap hint to the auto-create wording, got: ' + HINT.textContent);
+box.checked = false; box.onchange();
+if (HINT.textContent !== T.workspace_paths_validated_hint)
+  throw new Error('unticked box must restore the validated-dirs wording, got: ' + HINT.textContent);
 console.log('OK');
 """
     assert "OK" in _run_node(script)
